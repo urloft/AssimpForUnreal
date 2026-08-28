@@ -1,0 +1,19 @@
+ply
+format ascii 1.0
+comment AssimpForUnreal test fixture: one triangle whose vertices sit on the three
+comment source-space basis axes, so the coordinate conversion can be asserted exactly.
+comment Expected mapping (Unreal.X = -Source.Z, Unreal.Y = Source.X, Unreal.Z = Source.Y):
+comment   (1,0,0) -> ( 0, 1, 0)
+comment   (0,1,0) -> ( 0, 0, 1)
+comment   (0,0,1) -> (-1, 0, 0)
+element vertex 3
+property float x
+property float y
+property float z
+element face 1
+property list uchar int vertex_index
+end_header
+1 0 0
+0 1 0
+0 0 1
+3 0 1 2

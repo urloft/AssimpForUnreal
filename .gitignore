@@ -1,0 +1,17 @@
+# Unreal build output
+Binaries/
+Intermediate/
+Build/
+Saved/
+DerivedDataCache/
+*.VC.db
+*.opensdf
+*.sdf
+*.suo
+.vs/
+.idea/
+
+# Assimp working tree created by Scripts/BuildAssimp.ps1 (source clone + CMake build dir).
+# The *outputs* under Source/ThirdParty/AssimpLibrary/{include,lib,bin} ARE committed via LFS.
+Scripts/.assimp-src/
+Scripts/.assimp-build/

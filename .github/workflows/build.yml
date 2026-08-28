@@ -1,0 +1,162 @@
+name: Build
+
+# Builds the plugin against UE 5.8 and runs the automation tests.
+#
+# Requires a self-hosted Windows runner with Unreal Engine 5.8 installed: the engine is ~100 GB and
+# is not redistributable, so no hosted GitHub runner can build an Unreal plugin. Set the repository
+# variable UE_ROOT to the engine root (for example C:\Program Files\Epic Games\UE_5.8).
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: [ self-hosted, windows, unreal-5.8 ]
+
+    env:
+      UE_ROOT: ${{ vars.UE_ROOT }}
+      HOST_PROJECT: ${{ github.workspace }}\CI\AssimpHost\AssimpHost.uproject
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          # The Assimp binaries are LFS objects; without them the build fails on a text pointer.
+          lfs: true
+
+      - name: Verify vendored binaries were fetched
+        shell: pwsh
+        run: |
+          $dll = "Source/ThirdParty/AssimpLibrary/bin/Win64/assimp.dll"
+          if (-not (Test-Path $dll)) { throw "$dll is missing." }
+          # An unfetched LFS object is a ~130 byte text pointer rather than a multi-megabyte DLL.
+          $size = (Get-Item $dll).Length
+          if ($size -lt 1MB) { throw "$dll is $size bytes; LFS objects were not fetched." }
+          Write-Host "assimp.dll: $size bytes"
+
+      - name: Generate host project
+        shell: pwsh
+        run: |
+          # A plugin cannot be compiled on its own, so CI creates the same throwaway C++ host project
+          # the plugin is developed against.
+          $root = "${{ github.workspace }}\CI\AssimpHost"
+          New-Item -ItemType Directory -Force -Path "$root\Source\AssimpHost" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$root\Plugins" | Out-Null
+
+          @'
+          {
+            "FileVersion": 3,
+            "EngineAssociation": "5.8",
+            "Modules": [ { "Name": "AssimpHost", "Type": "Runtime", "LoadingPhase": "Default" } ],
+            "Plugins": [ { "Name": "AssimpForUnreal", "Enabled": true } ]
+          }
+          '@ | Set-Content -Path "$root\AssimpHost.uproject" -Encoding utf8
+
+          @'
+          using UnrealBuildTool;
+          public class AssimpHostEditorTarget : TargetRules
+          {
+              public AssimpHostEditorTarget(TargetInfo Target) : base(Target)
+              {
+                  Type = TargetType.Editor;
+                  DefaultBuildSettings = BuildSettingsVersion.Latest;
+                  IncludeOrderVersion = EngineIncludeOrderVersion.Latest;
+                  ExtraModuleNames.Add("AssimpHost");
+              }
+          }
+          '@ | Set-Content -Path "$root\Source\AssimpHostEditor.Target.cs" -Encoding utf8
+
+          @'
+          using UnrealBuildTool;
+          public class AssimpHostTarget : TargetRules
+          {
+              public AssimpHostTarget(TargetInfo Target) : base(Target)
+              {
+                  Type = TargetType.Game;
+                  DefaultBuildSettings = BuildSettingsVersion.Latest;
+                  IncludeOrderVersion = EngineIncludeOrderVersion.Latest;
+                  ExtraModuleNames.Add("AssimpHost");
+              }
+          }
+          '@ | Set-Content -Path "$root\Source\AssimpHost.Target.cs" -Encoding utf8
+
+          @'
+          using UnrealBuildTool;
+          public class AssimpHost : ModuleRules
+          {
+              public AssimpHost(ReadOnlyTargetRules Target) : base(Target)
+              {
+                  PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+                  PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine" });
+              }
+          }
+          '@ | Set-Content -Path "$root\Source\AssimpHost\AssimpHost.Build.cs" -Encoding utf8
+
+          @'
+          #include "CoreMinimal.h"
+          #include "Modules/ModuleManager.h"
+          IMPLEMENT_PRIMARY_GAME_MODULE(FDefaultGameModuleImpl, AssimpHost, "AssimpHost");
+          '@ | Set-Content -Path "$root\Source\AssimpHost\AssimpHost.cpp" -Encoding utf8
+
+          # Junction rather than copy, so the build sees the checked-out sources directly.
+          cmd /c mklink /J "$root\Plugins\AssimpForUnreal" "${{ github.workspace }}"
+
+      - name: Build editor target
+        shell: pwsh
+        run: |
+          & "$env:UE_ROOT\Engine\Build\BatchFiles\Build.bat" AssimpHostEditor Win64 Development `
+            -Project="$env:HOST_PROJECT" -WaitMutex -NoHotReload
+          if ($LASTEXITCODE -ne 0) { throw "Build failed with exit code $LASTEXITCODE." }
+
+      - name: Run automation tests
+        shell: pwsh
+        run: |
+          $log = "${{ github.workspace }}\CI\tests.log"
+          & "$env:UE_ROOT\Engine\Binaries\Win64\UnrealEditor-Cmd.exe" "$env:HOST_PROJECT" `
+            -ExecCmds="Automation RunTests AssimpForUnreal; Quit" `
+            -unattended -nullrhi -nosplash -NoSound -NoPause -abslog="$log"
+          $exit = $LASTEXITCODE
+
+          # Surface the per-test outcomes in the job log regardless of the result.
+          Select-String -Path $log -Pattern 'Test Completed. Result=' |
+            ForEach-Object { $_.Line -replace '^.*LogAutomationController: ','' }
+
+          if ($exit -ne 0) {
+            Select-String -Path $log -Pattern 'LogAutomationController: Error' |
+              ForEach-Object { $_.Line -replace '^.*LogAutomationController: ','' }
+            throw "Automation tests failed with exit code $exit."
+          }
+
+      - name: Verify no Assimp headers leaked into public headers
+        shell: pwsh
+        run: |
+          # The plugin's central invariant: Assimp is visible only inside AssimpCore/Private. If this
+          # ever regresses, consumers start inheriting Assimp's <windows.h> macro pollution.
+          $offenders = Get-ChildItem -Path Source -Recurse -Filter *.h |
+            Select-String -Pattern '#include "assimp/' |
+            Where-Object { $_.Path -notmatch 'AssimpCore\Private\AssimpIncludes\.h$' }
+
+          if ($offenders) {
+            $offenders | ForEach-Object { Write-Host "$($_.Path):$($_.LineNumber): $($_.Line.Trim())" }
+            throw "Assimp headers are included outside AssimpIncludes.h."
+          }
+          Write-Host "No leaked Assimp includes."
+
+      - name: Package plugin
+        shell: pwsh
+        run: |
+          & "$env:UE_ROOT\Engine\Build\BatchFiles\RunUAT.bat" BuildPlugin `
+            -Plugin="${{ github.workspace }}\AssimpForUnreal.uplugin" `
+            -Package="${{ github.workspace }}\CI\Packaged" `
+            -TargetPlatforms=Win64
+          if ($LASTEXITCODE -ne 0) { throw "BuildPlugin failed with exit code $LASTEXITCODE." }
+
+      - name: Upload packaged plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: AssimpForUnreal-Win64
+          path: CI/Packaged
+          if-no-files-found: error

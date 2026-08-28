@@ -1,0 +1,38 @@
+{
+    "AssimpTag": "v6.0.5",
+    "AssimpCommit": "392a658f9c271be965271f45e7521a1b80ea4392",
+    "Platform": "Win64",
+    "LibName": "assimp.lib",
+    "DllName": "assimp.dll",
+    "Configuration": "Release",
+    "CMakeArgs": [
+        "-S",
+        "C:\\Dev\\Unreal\\Plugins\\AssimpForUnreal\\Scripts\\.assimp-src",
+        "-B",
+        "C:\\Dev\\Unreal\\Plugins\\AssimpForUnreal\\Scripts\\.assimp-build",
+        "-A",
+        "x64",
+        "-DLIBRARY_SUFFIX=",
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DBUILD_SHARED_LIBS=ON",
+        "-DUSE_STATIC_CRT=OFF",
+        "-DASSIMP_NO_EXPORT=ON",
+        "-DASSIMP_BUILD_ZLIB=ON",
+        "-DASSIMP_BUILD_DRACO_STATIC=ON",
+        "-DASSIMP_BUILD_TESTS=OFF",
+        "-DASSIMP_BUILD_SAMPLES=OFF",
+        "-DASSIMP_BUILD_ASSIMP_TOOLS=OFF",
+        "-DASSIMP_BUILD_ASSIMP_VIEW=OFF",
+        "-DASSIMP_INSTALL=OFF",
+        "-DASSIMP_WARNINGS_AS_ERRORS=OFF",
+        "-DASSIMP_IGNORE_GIT_HASH=ON",
+        "-DASSIMP_INJECT_DEBUG_POSTFIX=OFF",
+        "-DASSIMP_BUILD_DOCS=OFF",
+        "-DASSIMP_OPT_BUILD_PACKAGES=OFF"
+    ],
+    "CMakeVersion": "cmake version 4.3.0-rc1",
+    "BuiltBy": "Pratik on LAPTOP-DN1NBG16",
+    "DependencyDlls": [
+        "draco.dll"
+    ]
+}

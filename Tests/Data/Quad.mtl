@@ -1,0 +1,5 @@
+# AssimpForUnreal test fixture material.
+newmtl QuadMaterial
+Kd 0.250000 0.500000 0.750000
+Ke 0.100000 0.000000 0.000000
+d 0.500000
