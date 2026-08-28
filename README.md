@@ -1,6 +1,9 @@
-# AssimpForUnreal
+# AssimpForUnreal — Assimp mesh importer for Unreal Engine 5
 
-Import 3D models into Unreal Engine 5 using the [Open Asset Import Library (Assimp)](https://github.com/assimp/assimp).
+An Unreal Engine 5 plugin that imports 3D models in **71 formats** using the
+[Open Asset Import Library (Assimp)](https://github.com/assimp/assimp) — including FBX, glTF/GLB
+(with Draco), OBJ, PLY, STL, Collada/DAE, 3DS, Blender, DXF, IFC, LWO, MD5, X and many more — both
+as **editor assets** and at **runtime in packaged games**.
 
 Two import paths, one conversion:
 
@@ -17,7 +20,7 @@ editor behaves identically at runtime.
 
 ## Status
 
-Assimp **6.0.5** · Unreal Engine **5.8** · **Win64** · 11 automation tests, all passing.
+Assimp **6.0.5** · Unreal Engine **5.8** · **Win64** · 15 automation tests plus a ~440-file corpus sweep, all passing.
 
 This is a **beta**. What works and what does not:
 
