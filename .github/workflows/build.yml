@@ -45,6 +45,17 @@ jobs:
           $root = "${{ github.workspace }}\CI\AssimpHost"
           New-Item -ItemType Directory -Force -Path "$root\Source\AssimpHost" | Out-Null
           New-Item -ItemType Directory -Force -Path "$root\Plugins" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$root\Content" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$root\Config" | Out-Null
+
+          # A startup map and a Content directory are not optional here. Without them the editor
+          # abandons startup before -ExecCmds ever runs, so the automation step reports no tests at
+          # all -- and passes, because nothing failed.
+          @'
+          [/Script/EngineSettings.GameMapsSettings]
+          EditorStartupMap=/Engine/Maps/Templates/Template_Default.Template_Default
+          GameDefaultMap=/Engine/Maps/Templates/Template_Default.Template_Default
+          '@ | Set-Content -Path "$root\Config\DefaultEngine.ini" -Encoding utf8
 
           @'
           {
@@ -116,13 +127,21 @@ jobs:
         run: |
           $log = "${{ github.workspace }}\CI\tests.log"
           & "$env:UE_ROOT\Engine\Binaries\Win64\UnrealEditor-Cmd.exe" "$env:HOST_PROJECT" `
-            -ExecCmds="Automation RunTests AssimpForUnreal; Quit" `
+            -ExecCmds="Automation RunTests AssimpForUnreal" `
+            -TestExit="Automation Test Queue Empty" `
             -unattended -nullrhi -nosplash -NoSound -NoPause -abslog="$log"
           $exit = $LASTEXITCODE
 
           # Surface the per-test outcomes in the job log regardless of the result.
-          Select-String -Path $log -Pattern 'Test Completed. Result=' |
-            ForEach-Object { $_.Line -replace '^.*LogAutomationController: ','' }
+          $completed = @(Select-String -Path $log -Pattern 'Test Completed. Result=')
+          $completed | ForEach-Object { $_.Line -replace '^.*LogAutomationController: ','' }
+
+          # A run that executed nothing is the failure mode this job is most exposed to: the editor
+          # can abandon startup, or the filter can stop matching, and either way the step would
+          # otherwise report success having verified nothing.
+          if ($completed.Count -lt 1) {
+            throw "No automation tests ran. The editor exited before the tests started, or the filter matched nothing."
+          }
 
           if ($exit -ne 0) {
             Select-String -Path $log -Pattern 'LogAutomationController: Error' |
