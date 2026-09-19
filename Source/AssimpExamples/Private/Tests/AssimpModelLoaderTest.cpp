@@ -10,6 +10,12 @@
 #include "Misc/Paths.h"
 #include "RHI.h"
 #include "SceneManagement.h"
+#include "UDynamicMesh.h"
+
+// GetTransientPackage() returns a UPackage*, and passing one where a UObject* is expected needs the
+// full type. The editor's unity build supplies it from a neighbouring file; an isolated packaging
+// build does not, and the error there is the unhelpful "cannot convert from UPackage* to UObject*".
+#include "UObject/Package.h"
 
 #if WITH_DEV_AUTOMATION_TESTS
 
@@ -262,7 +268,7 @@ bool FAssimpDiagnoseModelTest::RunTest(const FString& /*Parameters*/)
 			*FString::Join(Names, TEXT(", "))));
 
 		for (const TCHAR* Required : { TEXT("BaseColorTexture"), TEXT("NormalTexture"),
-			TEXT("RoughnessTexture"), TEXT("MetallicTexture") })
+			TEXT("RoughnessTexture"), TEXT("MetallicTexture"), TEXT("SpecularTexture") })
 		{
 			TestTrue(FString::Printf(TEXT("Default material exposes '%s'"), Required),
 				Names.Contains(Required));
@@ -287,10 +293,28 @@ bool FAssimpDiagnoseModelTest::RunTest(const FString& /*Parameters*/)
 
 		for (const TCHAR* Required : { TEXT("UseBaseColorTexture"), TEXT("UseRoughnessTexture"),
 			TEXT("UseMetallicTexture"), TEXT("UseEmissiveTexture"), TEXT("UseOcclusionTexture"),
-			TEXT("UseOpacityMask") })
+			TEXT("UseSpecularTexture"), TEXT("UseOpacityMask") })
 		{
 			TestTrue(FString::Printf(TEXT("Default material exposes scalar '%s'"), Required),
 				ScalarNames.Contains(Required));
+		}
+
+		// Specular has to be a parameter, and it has to default to Unreal's neutral 0.5. A material
+		// regenerated with it defaulting to 0 or 1 would change the look of every model that says
+		// nothing about specularity, which is most of them -- and nothing else here would notice.
+		for (const TCHAR* Required : { TEXT("Specular"), TEXT("Roughness"), TEXT("Metallic") })
+		{
+			TestTrue(FString::Printf(TEXT("Default material exposes scalar '%s'"), Required),
+				ScalarNames.Contains(Required));
+		}
+
+		float DefaultSpecular = -1.0f;
+		if (PluginDefault->GetScalarParameterValue(
+				FMaterialParameterInfo(TEXT("Specular")), DefaultSpecular))
+		{
+			TestTrue(FString::Printf(TEXT("Specular defaults to Unreal's neutral 0.5 (got %.4f)"),
+					DefaultSpecular),
+				FMath::IsNearlyEqual(DefaultSpecular, 0.5f, 0.001f));
 		}
 
 		int32 BoundToInstance = 0;
@@ -533,7 +557,7 @@ bool FAssimpCorpusSweepTest::RunTest(const FString& /*Parameters*/)
 		AddInfo(FString::Printf(
 			TEXT("SWEEP OK   %-46s meshes=%-4d tris=%-7d mats=%-3d anims=%-3d conv=%d size=%s"),
 			*Relative, Info.Meshes.Num(), TotalTris, Info.Materials.Num(),
-			Info.AnimationNames.Num(), bConverted ? 1 : 0,
+			Info.Animations.Num(), bConverted ? 1 : 0,
 			Bounds.IsValid ? *Bounds.GetSize().ToCompactString() : TEXT("n/a")));
 
 	}

@@ -10,6 +10,9 @@
 
 #include "IImageWrapper.h"
 #include "IImageWrapperModule.h"
+#include "InterchangeAnimationTrackSetNode.h"
+#include "InterchangeCommonAnimationPayload.h"
+#include "InterchangeJointNode.h"
 #include "InterchangeManager.h"
 #include "InterchangeResult.h"
 #include "InterchangeMaterialDefinitions.h"
@@ -49,6 +52,44 @@ namespace AssimpInterchangePrivate
 	FString MakeSceneNodeUid(int32 NodeIndex, const FString& NodeName)
 	{
 		return FString::Printf(TEXT("%s%d_%s"), SceneNodePrefix, NodeIndex, *NodeName);
+	}
+
+	/** Track-set node UID for one clip driving one skeleton. */
+	FString MakeSkeletalAnimationNodeUid(const FString& SkeletonRootUid, int32 AnimationIndex)
+	{
+		return FString::Printf(TEXT("\\SkeletalAnimation\\%s_%d"), *SkeletonRootUid, AnimationIndex);
+	}
+
+	/**
+	 * Payload key for one bone track: the clip and the node it drives.
+	 *
+	 * Indices rather than names on purpose. Node names come from the file, may repeat, and may
+	 * contain any character at all -- including whatever separator a key format picks -- so a
+	 * name-based key is one oddly named bone away from being unparseable.
+	 */
+	FString MakeAnimationPayloadKey(int32 AnimationIndex, int32 NodeIndex)
+	{
+		return FString::Printf(TEXT("%d;%d"), AnimationIndex, NodeIndex);
+	}
+
+	/** Decodes a key produced by MakeAnimationPayloadKey. */
+	bool ParseAnimationPayloadKey(const FString& Key, int32& OutAnimationIndex, int32& OutNodeIndex)
+	{
+		FString AnimationPart;
+		FString NodePart;
+		if (!Key.Split(TEXT(";"), &AnimationPart, &NodePart))
+		{
+			return false;
+		}
+
+		if (!AnimationPart.IsNumeric() || !NodePart.IsNumeric())
+		{
+			return false;
+		}
+
+		OutAnimationIndex = FCString::Atoi(*AnimationPart);
+		OutNodeIndex = FCString::Atoi(*NodePart);
+		return true;
 	}
 
 	/** Material instance node UID for a material index. */
@@ -152,7 +193,8 @@ EInterchangeTranslatorAssetType UInterchangeAssimpTranslator::GetSupportedAssetT
 {
 	return EInterchangeTranslatorAssetType::Meshes
 		| EInterchangeTranslatorAssetType::Materials
-		| EInterchangeTranslatorAssetType::Textures;
+		| EInterchangeTranslatorAssetType::Textures
+		| EInterchangeTranslatorAssetType::Animations;
 }
 
 TArray<FString> UInterchangeAssimpTranslator::GetSupportedFormats() const
@@ -300,6 +342,11 @@ bool UInterchangeAssimpTranslator::Translate(UInterchangeBaseNodeContainer& Base
 		MaterialNode->AddVectorParameterValue(PBRMR::Parameters::BaseColor.ToString(), Material.BaseColor);
 		MaterialNode->AddScalarParameterValue(PBRMR::Parameters::Metallic.ToString(), Material.Metallic);
 		MaterialNode->AddScalarParameterValue(PBRMR::Parameters::Roughness.ToString(), Material.Roughness);
+
+		// Unreal treats Specular as reflectance / 0.08, so its neutral value is 0.5 and not 1.
+		// FAssimpMaterialInfo already expresses the file's specular strength in that convention,
+		// whichever material model the file used, so it is passed through rather than rescaled here.
+		MaterialNode->AddScalarParameterValue(PBRMR::Parameters::Specular.ToString(), Material.Specular);
 		MaterialNode->AddVectorParameterValue(Common::Parameters::EmissiveColor.ToString(), Material.EmissiveColor);
 
 		if (Material.bIsTranslucent)
@@ -396,17 +443,83 @@ bool UInterchangeAssimpTranslator::Translate(UInterchangeBaseNodeContainer& Base
 	}
 
 	// ---------------------------------------------------------------------------------------------
+	// Skeletons
+	// ---------------------------------------------------------------------------------------------
+	// Resolved before anything else is emitted, because it decides the shape of everything that
+	// follows: which scene nodes become joints, which meshes become one skeletal mesh instead of
+	// several static ones, and which skeleton each animation clip drives.
+	TMap<FString, int32> NodeIndexByName;
+	NodeIndexByName.Reserve(Info.Nodes.Num());
+	for (int32 NodeIndex = 0; NodeIndex < Info.Nodes.Num(); ++NodeIndex)
+	{
+		// First occurrence wins. Node names are not unique in most formats, and a bone reference
+		// names a node the same way Assimp itself resolves it: by the first match.
+		NodeIndexByName.FindOrAdd(Info.Nodes[NodeIndex].Name, NodeIndex);
+	}
+
+	// Scene node UIDs are derived from index and name, so they can be spelled before the nodes
+	// exist. That is what lets a skeletal mesh node name its skeleton root, which is emitted later.
+	TArray<FString> SceneNodeUids;
+	SceneNodeUids.Reserve(Info.Nodes.Num());
+	for (int32 NodeIndex = 0; NodeIndex < Info.Nodes.Num(); ++NodeIndex)
+	{
+		SceneNodeUids.Add(MakeSceneNodeUid(NodeIndex, Info.Nodes[NodeIndex].Name));
+	}
+
+	TSet<FString> JointNodeNames;
+	for (const FAssimpSkinnedMeshGroup& Group : Info.SkinnedMeshGroups)
+	{
+		for (const FAssimpSkeletonBone& Bone : Group.Bones)
+		{
+			JointNodeNames.Add(Bone.Name);
+		}
+	}
+
+	// ---------------------------------------------------------------------------------------------
 	// Meshes
 	// ---------------------------------------------------------------------------------------------
+	// Every mesh maps to the node that carries it. Skinned meshes sharing a skeleton map to one
+	// shared skeletal mesh node, which is why this is per mesh index rather than a parallel array.
+	TArray<FString> MeshNodeUidForMesh;
+	MeshNodeUidForMesh.SetNum(Info.Meshes.Num());
+
 	TArray<FString> MeshNodeUids;
 	MeshNodeUids.Reserve(Info.Meshes.Num());
 
+	// Meshes claimed by a skeleton, so the static pass can skip them.
+	TSet<int32> SkinnedMeshIndices;
+	for (const FAssimpSkinnedMeshGroup& Group : Info.SkinnedMeshGroups)
+	{
+		SkinnedMeshIndices.Append(Group.MeshIndices);
+	}
+
+	/** Attaches a mesh node's material slots. Slot names must match what FAssimpMeshConverter writes. */
+	auto BindMaterialSlots = [&Info, &MaterialNodeUids](UInterchangeMeshNode* MeshNode, int32 MeshIndex)
+	{
+		const FAssimpMeshInfo& Mesh = Info.Meshes[MeshIndex];
+		if (!MaterialNodeUids.IsValidIndex(Mesh.MaterialIndex))
+		{
+			return;
+		}
+
+		const FString SlotName = Mesh.Name.IsEmpty()
+			? FString::Printf(TEXT("Material_%d"), Mesh.MaterialIndex)
+			: Mesh.Name;
+		MeshNode->SetSlotMaterialDependencyUid(SlotName, MaterialNodeUids[Mesh.MaterialIndex]);
+	};
+
 	for (int32 MeshIndex = 0; MeshIndex < Info.Meshes.Num(); ++MeshIndex)
 	{
+		if (SkinnedMeshIndices.Contains(MeshIndex))
+		{
+			continue;
+		}
+
 		const FAssimpMeshInfo& Mesh = Info.Meshes[MeshIndex];
 
 		const FString NodeUid = MakeMeshNodeUid(MeshIndex, Mesh.Name);
 		MeshNodeUids.Add(NodeUid);
+		MeshNodeUidForMesh[MeshIndex] = NodeUid;
 
 		UInterchangeMeshNode* MeshNode = NewObject<UInterchangeMeshNode>(&BaseNodeContainer);
 		BaseNodeContainer.SetupNode(
@@ -425,17 +538,83 @@ bool UInterchangeAssimpTranslator::Translate(UInterchangeBaseNodeContainer& Base
 		MeshNode->SetCustomHasVertexBinormal(Mesh.bHasTangents);
 		MeshNode->SetCustomHasVertexColor(Mesh.bHasVertexColors);
 		MeshNode->SetCustomHasSmoothGroup(false);
-		MeshNode->SetSkinnedMesh(Mesh.bHasBones);
+		MeshNode->SetSkinnedMesh(false);
 
-		// Bind the mesh's material slot. The slot name must match the polygon group's imported
-		// material slot name that FAssimpMeshConverter writes, or the assignment silently misses.
-		if (MaterialNodeUids.IsValidIndex(Mesh.MaterialIndex))
+		BindMaterialSlots(MeshNode, MeshIndex);
+	}
+
+	// One skeletal mesh node per skeleton, merging every mesh bound to it.
+	//
+	// Merging is not an optimisation: skin weights are written as indices into the skeleton the
+	// conversion built, so two meshes sharing a skeleton must be converted together or their weights
+	// index two different bone orderings.
+	for (const FAssimpSkinnedMeshGroup& Group : Info.SkinnedMeshGroups)
+	{
+		const int32* RootNodeIndex = NodeIndexByName.Find(Group.RootBoneName);
+		if (RootNodeIndex == nullptr || !SceneNodeUids.IsValidIndex(*RootNodeIndex))
 		{
-			const FString SlotName = Mesh.Name.IsEmpty()
-				? FString::Printf(TEXT("Material_%d"), Mesh.MaterialIndex)
-				: Mesh.Name;
-			MeshNode->SetSlotMaterialDependencyUid(SlotName, MaterialNodeUids[Mesh.MaterialIndex]);
+			// The skeleton names a node the flattened hierarchy does not contain, which can only
+			// happen if the node walk hit its depth cap. Fall back to static import for these
+			// meshes rather than emitting a skeletal mesh with no skeleton to bind to.
+			UInterchangeResultWarning_Generic* Message = AddMessage<UInterchangeResultWarning_Generic>();
+			Message->SourceAssetName = FPaths::GetCleanFilename(Info.SourceFilePath);
+			Message->Text = FText::Format(
+				LOCTEXT("MissingSkeletonRoot",
+					"Skeleton root '{0}' is not present in the scene hierarchy; its meshes were imported as static geometry."),
+				FText::FromString(Group.RootBoneName));
+			continue;
 		}
+
+		const FAssimpMeshInfo& FirstMesh = Info.Meshes[Group.MeshIndices[0]];
+
+		// Named after the mesh and its skeleton root, matching what the engine's own glTF translator
+		// does: two characters sharing a mesh name still produce two distinguishable assets.
+		const FString NodeName = FString::Printf(TEXT("%s_%s"), *FirstMesh.Name, *Group.RootBoneName);
+		const FString NodeUid = MakeMeshNodeUid(Group.MeshIndices[0], NodeName);
+
+		UInterchangeMeshNode* MeshNode = NewObject<UInterchangeMeshNode>(&BaseNodeContainer);
+		BaseNodeContainer.SetupNode(
+			MeshNode, NodeUid, NodeName, EInterchangeNodeContainerType::TranslatedAsset);
+
+		MeshNode->SetPayLoadKey(
+			MakeMeshPayloadKey(Group.MeshIndices), EInterchangeMeshPayLoadType::SKELETAL);
+		MeshNode->SetSkinnedMesh(true);
+		MeshNode->SetSkeletonDependencyUid(SceneNodeUids[*RootNodeIndex]);
+
+		int32 TotalVertices = 0;
+		int32 TotalTriangles = 0;
+		bool bHasNormals = false;
+		bool bHasTangents = false;
+		bool bHasVertexColors = false;
+		FBox Bounds(ForceInit);
+
+		for (const int32 MeshIndex : Group.MeshIndices)
+		{
+			const FAssimpMeshInfo& Mesh = Info.Meshes[MeshIndex];
+			TotalVertices += Mesh.NumVertices;
+			TotalTriangles += Mesh.NumTriangles;
+			bHasNormals |= Mesh.bHasNormals;
+			bHasTangents |= Mesh.bHasTangents;
+			bHasVertexColors |= Mesh.bHasVertexColors;
+			if (Mesh.BoundingBox.IsValid)
+			{
+				Bounds += Mesh.BoundingBox;
+			}
+
+			MeshNodeUidForMesh[MeshIndex] = NodeUid;
+			BindMaterialSlots(MeshNode, MeshIndex);
+		}
+
+		MeshNode->SetCustomVertexCount(TotalVertices);
+		MeshNode->SetCustomPolygonCount(TotalTriangles);
+		MeshNode->SetCustomBoundingBox(Bounds);
+		MeshNode->SetCustomHasVertexNormal(bHasNormals);
+		MeshNode->SetCustomHasVertexTangent(bHasTangents);
+		MeshNode->SetCustomHasVertexBinormal(bHasTangents);
+		MeshNode->SetCustomHasVertexColor(bHasVertexColors);
+		MeshNode->SetCustomHasSmoothGroup(false);
+
+		MeshNodeUids.Add(NodeUid);
 	}
 
 	// ---------------------------------------------------------------------------------------------
@@ -443,65 +622,216 @@ bool UInterchangeAssimpTranslator::Translate(UInterchangeBaseNodeContainer& Base
 	// ---------------------------------------------------------------------------------------------
 	// FAssimpSceneInfo guarantees a parent always precedes its children, so a single forward pass
 	// can attach each node to an already-created parent.
-	TArray<FString> SceneNodeUids;
-	SceneNodeUids.SetNum(Info.Nodes.Num());
-
 	for (int32 NodeIndex = 0; NodeIndex < Info.Nodes.Num(); ++NodeIndex)
 	{
 		const FAssimpNodeInfo& Node = Info.Nodes[NodeIndex];
 
-		const FString NodeUid = MakeSceneNodeUid(NodeIndex, Node.Name);
-		SceneNodeUids[NodeIndex] = NodeUid;
+		const FString& NodeUid = SceneNodeUids[NodeIndex];
 
 		const FString ParentUid = Info.Nodes.IsValidIndex(Node.ParentIndex)
 			? SceneNodeUids[Node.ParentIndex]
 			: FString();
 
-		UInterchangeSceneNode* SceneNode = NewObject<UInterchangeSceneNode>(&BaseNodeContainer);
+		// A bone becomes a joint node rather than a plain scene node. That type is load-bearing: the
+		// skeletal mesh pipeline finds a skeleton by looking for a joint node whose parent is not
+		// one, so without it there is no skeleton, and therefore no skeletal mesh and no animation.
+		const bool bIsJoint = JointNodeNames.Contains(Node.Name);
+
+		UInterchangeSceneNode* SceneNode = bIsJoint
+			? NewObject<UInterchangeJointNode>(&BaseNodeContainer)
+			: NewObject<UInterchangeSceneNode>(&BaseNodeContainer);
+
 		BaseNodeContainer.SetupNode(
 			SceneNode, NodeUid, Node.Name, EInterchangeNodeContainerType::TranslatedScene, ParentUid);
 
 		SceneNode->SetCustomLocalTransform(&BaseNodeContainer, Node.LocalTransform);
 
+		if (bIsJoint)
+		{
+			UInterchangeJointNode* JointNode = CastChecked<UInterchangeJointNode>(SceneNode);
+
+			// Assimp exposes no separate bind pose: a bone's offset matrix is the inverse of its
+			// global bind transform, and the skeleton reconstruction already uses the node transforms
+			// as the reference pose. Declaring bind pose and time-zero pose as the same thing is
+			// therefore the truth about the data, and it also keeps the pipeline off its
+			// "rebind using time zero" fallback, which exists for files that contradict themselves.
+			JointNode->SetBindPoseLocalTransform(&BaseNodeContainer, Node.LocalTransform);
+			JointNode->SetTimeZeroLocalTransform(&BaseNodeContainer, Node.LocalTransform);
+		}
+
+		// Meshes a node draws, deduplicated: several source meshes of one skeleton resolve to the
+		// same skeletal mesh node, and instancing it twice would import the asset twice.
+		TArray<FString> AssetUids;
+		for (const int32 MeshIndex : Node.MeshIndices)
+		{
+			if (MeshNodeUidForMesh.IsValidIndex(MeshIndex) && !MeshNodeUidForMesh[MeshIndex].IsEmpty())
+			{
+				AssetUids.AddUnique(MeshNodeUidForMesh[MeshIndex]);
+			}
+		}
+
 		// A node drawing exactly one mesh maps straight onto a single mesh actor. A node drawing
 		// several needs a child per mesh, because an Interchange scene node references at most one
 		// asset instance.
-		if (Node.MeshIndices.Num() == 1 && MeshNodeUids.IsValidIndex(Node.MeshIndices[0]))
+		if (AssetUids.Num() == 1)
 		{
-			SceneNode->SetCustomAssetInstanceUid(MeshNodeUids[Node.MeshIndices[0]]);
+			SceneNode->SetCustomAssetInstanceUid(AssetUids[0]);
 		}
-		else if (Node.MeshIndices.Num() > 1)
+		else if (AssetUids.Num() > 1)
 		{
-			for (const int32 MeshIndex : Node.MeshIndices)
+			for (int32 AssetOrdinal = 0; AssetOrdinal < AssetUids.Num(); ++AssetOrdinal)
 			{
-				if (!MeshNodeUids.IsValidIndex(MeshIndex))
-				{
-					continue;
-				}
-
-				const FString ChildUid = FString::Printf(TEXT("%s_Mesh%d"), *NodeUid, MeshIndex);
+				const FString ChildUid = FString::Printf(TEXT("%s_Mesh%d"), *NodeUid, AssetOrdinal);
 
 				UInterchangeSceneNode* MeshHolder = NewObject<UInterchangeSceneNode>(&BaseNodeContainer);
 				BaseNodeContainer.SetupNode(
 					MeshHolder,
 					ChildUid,
-					Info.Meshes[MeshIndex].Name,
+					FString::Printf(TEXT("%s_%d"), *Node.Name, AssetOrdinal),
 					EInterchangeNodeContainerType::TranslatedScene,
 					NodeUid);
 
 				// Identity: the parent already carries the placement.
 				MeshHolder->SetCustomLocalTransform(&BaseNodeContainer, FTransform::Identity);
-				MeshHolder->SetCustomAssetInstanceUid(MeshNodeUids[MeshIndex]);
+				MeshHolder->SetCustomAssetInstanceUid(AssetUids[AssetOrdinal]);
 			}
 		}
 	}
 
+	// ---------------------------------------------------------------------------------------------
+	// Animation
+	// ---------------------------------------------------------------------------------------------
+	const int32 AnimationTrackCount =
+		BuildAnimationTracks(BaseNodeContainer, *Scene, NodeIndexByName, SceneNodeUids);
+
 	UE_LOG(LogAssimpInterchange, Log,
-		TEXT("Translated '%s': %d mesh node(s), %d material node(s), %d scene node(s)."),
+		TEXT("Translated '%s': %d mesh node(s) (%d skeletal), %d material node(s), %d scene node(s), ")
+		TEXT("%d animation track set(s)."),
 		*FPaths::GetCleanFilename(Info.SourceFilePath),
-		MeshNodeUids.Num(), MaterialNodeUids.Num(), SceneNodeUids.Num());
+		MeshNodeUids.Num(), Info.SkinnedMeshGroups.Num(),
+		MaterialNodeUids.Num(), SceneNodeUids.Num(), AnimationTrackCount);
 
 	return true;
+}
+
+int32 UInterchangeAssimpTranslator::BuildAnimationTracks(
+	UInterchangeBaseNodeContainer& BaseNodeContainer,
+	const FAssimpScene& Scene,
+	const TMap<FString, int32>& NodeIndexByName,
+	const TArray<FString>& SceneNodeUids) const
+{
+	using namespace AssimpInterchangePrivate;
+
+	const FAssimpSceneInfo& Info = Scene.GetSceneInfo();
+
+	if (Info.Animations.IsEmpty() || Info.SkinnedMeshGroups.IsEmpty())
+	{
+		// Clips that drive nothing skinned are dropped rather than imported as empty sequences.
+		// A UAnimSequence exists only against a USkeleton, so with no skeleton there is nothing to
+		// create; node-only animation would be a level-sequence import, which this translator does
+		// not claim to do.
+		if (!Info.Animations.IsEmpty())
+		{
+			UE_LOG(LogAssimpInterchange, Log,
+				TEXT("'%s' has %d animation clip(s) but no skinned mesh; no animation was translated."),
+				*FPaths::GetCleanFilename(Info.SourceFilePath), Info.Animations.Num());
+		}
+		return 0;
+	}
+
+	int32 TrackSetCount = 0;
+
+	for (int32 AnimationIndex = 0; AnimationIndex < Info.Animations.Num(); ++AnimationIndex)
+	{
+		const FAssimpAnimationInfo& Animation = Info.Animations[AnimationIndex];
+
+		// A clip is sampled at one rate over one range, chosen once here so that every bone in it is
+		// baked on the same frames. The pipeline may override both; these are the defaults it reads
+		// when the user asks for the file's own timing.
+		const double SampleRate = Scene.GetAnimationSampleRate(AnimationIndex);
+		const double StopTime = FMath::Max<double>(
+			Animation.DurationSeconds, (SampleRate > 0.0) ? 1.0 / SampleRate : 0.0);
+
+		const TSet<FString> AnimatedNodes(Animation.AnimatedNodeNames);
+
+		for (const FAssimpSkinnedMeshGroup& Group : Info.SkinnedMeshGroups)
+		{
+			const int32* RootNodeIndex = NodeIndexByName.Find(Group.RootBoneName);
+			if (RootNodeIndex == nullptr || !SceneNodeUids.IsValidIndex(*RootNodeIndex))
+			{
+				continue;
+			}
+
+			// Only the bones this clip actually moves get a payload. A clip that touches none of a
+			// skeleton's bones produces no track set for it at all, which is what stops a two-rig
+			// file importing every clip twice.
+			TArray<TPair<FString, FString>> BonePayloads;
+			for (const FAssimpSkeletonBone& Bone : Group.Bones)
+			{
+				if (!AnimatedNodes.Contains(Bone.Name))
+				{
+					continue;
+				}
+
+				const int32* BoneNodeIndex = NodeIndexByName.Find(Bone.Name);
+				if (BoneNodeIndex == nullptr || !SceneNodeUids.IsValidIndex(*BoneNodeIndex))
+				{
+					continue;
+				}
+
+				BonePayloads.Emplace(
+					SceneNodeUids[*BoneNodeIndex],
+					MakeAnimationPayloadKey(AnimationIndex, *BoneNodeIndex));
+			}
+
+			if (BonePayloads.IsEmpty())
+			{
+				continue;
+			}
+
+			const FString& SkeletonRootUid = SceneNodeUids[*RootNodeIndex];
+
+			UInterchangeSkeletalAnimationTrackNode* TrackNode =
+				NewObject<UInterchangeSkeletalAnimationTrackNode>(&BaseNodeContainer);
+
+			BaseNodeContainer.SetupNode(
+				TrackNode,
+				MakeSkeletalAnimationNodeUid(SkeletonRootUid, AnimationIndex),
+				Animation.Name,
+				EInterchangeNodeContainerType::TranslatedAsset);
+
+			// The skeleton is named by its root joint's scene node. The animation pipeline derives
+			// the skeleton factory node's UID from exactly this, which is how a clip and the mesh
+			// that defines the skeleton end up on the same USkeleton.
+			TrackNode->SetCustomSkeletonNodeUid(SkeletonRootUid);
+
+			TrackNode->SetCustomAnimationSampleRate(SampleRate);
+			TrackNode->SetCustomAnimationStartTime(0.0);
+			TrackNode->SetCustomAnimationStopTime(StopTime);
+
+			for (const TPair<FString, FString>& BonePayload : BonePayloads)
+			{
+				TrackNode->SetAnimationPayloadKeyForSceneNodeUid(
+					BonePayload.Key, BonePayload.Value, EInterchangeAnimationPayLoadType::BAKED);
+			}
+
+			++TrackSetCount;
+		}
+
+		if (Animation.bHasMeshOrMorphChannels)
+		{
+			// Said once per clip, because the alternative is a clip that imports looking complete
+			// while the deformation the artist authored is simply absent.
+			UInterchangeResultWarning_Generic* Message = AddMessage<UInterchangeResultWarning_Generic>();
+			Message->SourceAssetName = FPaths::GetCleanFilename(Info.SourceFilePath);
+			Message->Text = FText::Format(
+				LOCTEXT("MorphChannelsDropped",
+					"Animation '{0}' also animates mesh or morph-target channels. Those are not imported; only bone tracks were."),
+				FText::FromString(Animation.Name));
+		}
+	}
+
+	return TrackSetCount;
 }
 
 // =================================================================================================
@@ -576,6 +906,96 @@ TOptional<UE::Interchange::FMeshPayloadData> UInterchangeAssimpTranslator::GetMe
 	}
 
 	return PayloadData;
+}
+
+// =================================================================================================
+// Animation payload
+// =================================================================================================
+
+TArray<UE::Interchange::FAnimationPayloadData> UInterchangeAssimpTranslator::GetAnimationPayloadData(
+	const TArray<UE::Interchange::FAnimationPayloadQuery>& PayloadQueries) const
+{
+	using namespace AssimpInterchangePrivate;
+	using namespace UE::Interchange;
+
+	TArray<FAnimationPayloadData> Payloads;
+
+	const TSharedPtr<FAssimpScene> Scene = EnsureSceneLoaded();
+	if (!Scene.IsValid())
+	{
+		return Payloads;
+	}
+
+	const FAssimpSceneInfo& Info = Scene->GetSceneInfo();
+
+	Payloads.Reserve(PayloadQueries.Num());
+
+	for (const FAnimationPayloadQuery& Query : PayloadQueries)
+	{
+		// Only baked transforms are offered, and the track nodes only ever ask for them. Anything
+		// else means the graph and this provider have drifted apart, which is worth saying out loud.
+		if (Query.PayloadKey.Type != EInterchangeAnimationPayLoadType::BAKED)
+		{
+			UE_LOG(LogAssimpInterchange, Warning,
+				TEXT("Animation payload '%s' requested as type %d; only baked transforms are produced."),
+				*Query.PayloadKey.UniqueId, static_cast<int32>(Query.PayloadKey.Type));
+			continue;
+		}
+
+		int32 AnimationIndex = INDEX_NONE;
+		int32 NodeIndex = INDEX_NONE;
+		if (!ParseAnimationPayloadKey(Query.PayloadKey.UniqueId, AnimationIndex, NodeIndex))
+		{
+			UE_LOG(LogAssimpInterchange, Error,
+				TEXT("Unrecognised animation payload key '%s'."), *Query.PayloadKey.UniqueId);
+			continue;
+		}
+
+		if (!Info.Nodes.IsValidIndex(NodeIndex))
+		{
+			continue;
+		}
+
+		// The pipeline owns the timing: it may have been told to resample at a different rate or to
+		// import a sub-range, and the payload must follow that rather than the file's own. Falling
+		// back to the clip's declared rate covers a query that leaves it unset, which would
+		// otherwise bake a single frame.
+		double BakeFrequency = Query.TimeDescription.BakeFrequency;
+		if (!(BakeFrequency > 0.0))
+		{
+			BakeFrequency = Scene->GetAnimationSampleRate(AnimationIndex);
+		}
+
+		double RangeStart = Query.TimeDescription.RangeStartSecond;
+		double RangeStop = Query.TimeDescription.RangeStopSecond;
+		if (RangeStop <= RangeStart)
+		{
+			RangeStart = 0.0;
+			RangeStop = Info.Animations.IsValidIndex(AnimationIndex)
+				? Info.Animations[AnimationIndex].DurationSeconds
+				: 0.0;
+		}
+
+		FAnimationPayloadData PayloadData(Query.SceneNodeUniqueID, Query.PayloadKey);
+		PayloadData.BakeFrequency = BakeFrequency;
+		PayloadData.RangeStartTime = RangeStart;
+		PayloadData.RangeEndTime = RangeStop;
+
+		if (!Scene->GetBakedAnimationTrack(
+				AnimationIndex,
+				Info.Nodes[NodeIndex].Name,
+				BakeFrequency,
+				RangeStart,
+				RangeStop,
+				PayloadData.Transforms))
+		{
+			continue;
+		}
+
+		Payloads.Add(MoveTemp(PayloadData));
+	}
+
+	return Payloads;
 }
 
 // =================================================================================================

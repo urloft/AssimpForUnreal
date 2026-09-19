@@ -1,0 +1,19 @@
+# AssimpForUnreal test fixture: two triangles, one per material in Specular.mtl.
+#
+# The geometry is irrelevant and deliberately minimal -- this fixture exists only to carry two
+# Phong materials through the importer. Two separate triangles rather than one, because Assimp
+# splits a mesh per material and a single face could only ever carry one.
+mtllib Specular.mtl
+
+v 0.0 0.0 0.0
+v 1.0 0.0 0.0
+v 0.0 1.0 0.0
+v 2.0 0.0 0.0
+v 3.0 0.0 0.0
+v 2.0 1.0 0.0
+
+usemtl MatShiny
+f 1 2 3
+
+usemtl MatDull
+f 4 5 6

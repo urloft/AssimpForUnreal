@@ -909,4 +909,351 @@ bool FAssimpMismatchedExtensionTest::RunTest(const FString& Parameters)
 	return true;
 }
 
+// =================================================================================================
+// Specular response
+// =================================================================================================
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FAssimpMaterialSpecularTest,
+	"AssimpForUnreal.Core.MaterialSpecular",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+/**
+ * Asserts that a Phong material's specular response survives into Unreal's terms.
+ *
+ * Most of the formats this plugin exists to read predate physically based materials: they carry a
+ * specular colour and an exponent, and nothing a metallic/roughness renderer can use directly. The
+ * conversion is therefore a real translation, not a copy, and it has two ways to go quietly wrong.
+ * Dropping the exponent gives every material in a file the same default roughness, so nothing has a
+ * highlight where its author put one; mapping the specular colour onto Unreal's Specular input as a
+ * gain, rather than against the 4% dielectric baseline it actually means, doubles the reflectance of
+ * every file that never expressed an opinion. Both produce a model that renders -- just not the one
+ * in the file.
+ */
+bool FAssimpMaterialSpecularTest::RunTest(const FString& /*Parameters*/)
+{
+	// The neutral values are a contract with the materials: anything that says nothing about
+	// specularity must arrive at Unreal's own defaults, not at zero.
+	{
+		const FAssimpMaterialInfo Defaults;
+		TestEqual(TEXT("Default specular is Unreal's neutral 0.5"), Defaults.Specular, 0.5f);
+		TestEqual(TEXT("Default roughness is 0.5"), Defaults.Roughness, 0.5f);
+	}
+
+	const FString FilePath = AssimpTestUtils::GetTestDataPath(TEXT("Specular.obj"));
+	if (!TestTrue(TEXT("Test fixture path resolved"), !FilePath.IsEmpty()))
+	{
+		return false;
+	}
+
+	FAssimpLoadResult LoadResult;
+	const TSharedPtr<FAssimpScene> Scene =
+		FAssimpScene::LoadFromFile(FilePath, AssimpTestUtils::MakeExactSettings(), LoadResult);
+
+	if (!TestTrue(FString::Printf(TEXT("Specular.obj loaded (%s)"), *LoadResult.ErrorMessage),
+		Scene.IsValid()))
+	{
+		return false;
+	}
+
+	const FAssimpSceneInfo& Info = Scene->GetSceneInfo();
+
+	const FAssimpMaterialInfo* Shiny = Info.Materials.FindByPredicate(
+		[](const FAssimpMaterialInfo& Material) { return Material.Name.Contains(TEXT("MatShiny")); });
+	const FAssimpMaterialInfo* Dull = Info.Materials.FindByPredicate(
+		[](const FAssimpMaterialInfo& Material) { return Material.Name.Contains(TEXT("MatDull")); });
+
+	if (!TestNotNull(TEXT("MatShiny was read from the .mtl"), Shiny) ||
+		!TestNotNull(TEXT("MatDull was read from the .mtl"), Dull))
+	{
+		return false;
+	}
+
+	AddInfo(FString::Printf(TEXT("MatShiny: specular=%.4f roughness=%.4f Ks=%s"),
+		Shiny->Specular, Shiny->Roughness, *Shiny->SpecularColor.ToString()));
+	AddInfo(FString::Printf(TEXT("MatDull:  specular=%.4f roughness=%.4f Ks=%s"),
+		Dull->Specular, Dull->Roughness, *Dull->SpecularColor.ToString()));
+
+	// The colour is carried through untouched, so a caller driving its own material can still see
+	// what the file said before it was reduced to one number.
+	TestTrue(FString::Printf(TEXT("MatShiny keeps Ks white (got %s)"), *Shiny->SpecularColor.ToString()),
+		Shiny->SpecularColor.Equals(FLinearColor::White, 0.01f));
+	TestTrue(FString::Printf(TEXT("MatDull keeps Ks 0.2 grey (got %s)"), *Dull->SpecularColor.ToString()),
+		FMath::IsNearlyEqual(Dull->SpecularColor.R, 0.2f, 0.01f));
+
+	// White Ks is what an exporter writes when nobody chose anything, so it must land on Unreal's
+	// neutral 0.5 and leave the model looking exactly as it would with no specular data at all.
+	TestTrue(FString::Printf(TEXT("White Ks maps to the neutral 0.5 (got %.4f)"), Shiny->Specular),
+		FMath::IsNearlyEqual(Shiny->Specular, 0.5f, 0.01f));
+
+	// A fifth of that reflectance is a fifth of the value: 0.5 * 0.2.
+	TestTrue(FString::Printf(TEXT("Ks 0.2 maps to 0.1 (got %.4f)"), Dull->Specular),
+		FMath::IsNearlyEqual(Dull->Specular, 0.1f, 0.01f));
+
+	// Roughness comes from the exponent. The exact figure depends on how the OBJ importer scales Ns,
+	// which is Assimp's business and has changed between releases, so what is asserted is the part
+	// that is ours: that the exponent is used at all, and that it orders the two materials the way
+	// the file does. A conversion that ignored it would leave both at the 0.5 default, which fails
+	// both halves.
+	TestTrue(FString::Printf(TEXT("A tight highlight gives low roughness (got %.4f)"), Shiny->Roughness),
+		Shiny->Roughness > 0.0f && Shiny->Roughness < 0.35f);
+	TestTrue(FString::Printf(TEXT("A broad highlight gives high roughness (got %.4f)"), Dull->Roughness),
+		Dull->Roughness > 0.5f);
+	TestTrue(TEXT("The shinier material is the less rough one"),
+		Shiny->Roughness < Dull->Roughness);
+
+	return true;
+}
+
+// =================================================================================================
+// Animation
+// =================================================================================================
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FAssimpAnimationTest,
+	"AssimpForUnreal.Core.Animation",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+/**
+ * Asserts that an animation clip is described, grouped with its skeleton, and baked correctly.
+ *
+ * The fixture's clip drives one bone with a translation along one source axis and a rotation about
+ * a different one, which is what makes this a test of the conversion rather than of parsing. The
+ * decisive assertion is the last: applying a converted transform to a converted point must give the
+ * same answer as converting the point the source transform produces. That identity holds only if the
+ * change of basis was applied as a conjugation. Remapping the translation alone -- the obvious
+ * shortcut, and one that passes any translation-only clip -- breaks it the moment a rotation is
+ * involved, and the symptom in a real import is a character whose limbs bend the wrong way.
+ */
+bool FAssimpAnimationTest::RunTest(const FString& /*Parameters*/)
+{
+	const FString FilePath = AssimpTestUtils::GetTestDataPath(TEXT("SkinnedQuad.gltf"));
+	if (!TestTrue(TEXT("Test fixture path resolved"), !FilePath.IsEmpty()))
+	{
+		return false;
+	}
+
+	FAssimpImportSettings Settings = AssimpTestUtils::MakeExactSettings();
+	Settings.bImportSkeletalMesh = true;
+	Settings.bImportAnimations = true;
+
+	// glTF declares metres; without this every expected translation below would be 100x larger.
+	Settings.bApplyFileUnitScale = false;
+
+	FAssimpLoadResult LoadResult;
+	const TSharedPtr<FAssimpScene> Scene = FAssimpScene::LoadFromFile(FilePath, Settings, LoadResult);
+
+	if (!TestTrue(FString::Printf(TEXT("SkinnedQuad.gltf loaded (%s)"), *LoadResult.ErrorMessage),
+		Scene.IsValid()))
+	{
+		return false;
+	}
+
+	const FAssimpSceneInfo& Info = Scene->GetSceneInfo();
+
+	// --- The clip is described ------------------------------------------------------------------
+	if (!TestEqual(TEXT("One animation clip"), Info.Animations.Num(), 1))
+	{
+		return false;
+	}
+
+	const FAssimpAnimationInfo& Animation = Info.Animations[0];
+
+	AddInfo(FString::Printf(TEXT("Clip '%s': %.4fs, ticks/second %.1f, %d animated node(s)"),
+		*Animation.Name, Animation.DurationSeconds, Animation.TicksPerSecond,
+		Animation.AnimatedNodeNames.Num()));
+
+	TestEqual(TEXT("Clip keeps its name"), Animation.Name, FString(TEXT("Wave")));
+
+	// The fixture's keys span exactly one second. glTF states its timebase in milliseconds, so a
+	// conversion that mistook the timebase for a frame rate, or skipped it, would not land here.
+	TestTrue(FString::Printf(TEXT("Clip is one second long (got %.4f)"), Animation.DurationSeconds),
+		FMath::IsNearlyEqual(Animation.DurationSeconds, 1.0f, 0.01f));
+
+	TestEqual(TEXT("Exactly one node is animated"), Animation.AnimatedNodeNames.Num(), 1);
+	TestTrue(TEXT("Bone1 is the animated node"), Animation.AnimatedNodeNames.Contains(TEXT("Bone1")));
+	TestFalse(TEXT("No mesh or morph channels in this clip"), Animation.bHasMeshOrMorphChannels);
+
+	// --- The skeleton the clip can drive --------------------------------------------------------
+	if (!TestEqual(TEXT("One skinned mesh group"), Info.SkinnedMeshGroups.Num(), 1))
+	{
+		return false;
+	}
+
+	const FAssimpSkinnedMeshGroup& Group = Info.SkinnedMeshGroups[0];
+	TestEqual(TEXT("Group is rooted at Root"), Group.RootBoneName, FString(TEXT("Root")));
+	TestEqual(TEXT("Group holds both bones"), Group.Bones.Num(), 2);
+	TestEqual(TEXT("Group holds the one skinned mesh"), Group.MeshIndices.Num(), 1);
+
+	if (Group.Bones.Num() == 2)
+	{
+		TestEqual(TEXT("Root is first"), Group.Bones[0].Name, FString(TEXT("Root")));
+		TestEqual(TEXT("Bone1 is second"), Group.Bones[1].Name, FString(TEXT("Bone1")));
+		TestEqual(TEXT("Bone1's parent is the root"), Group.Bones[1].ParentIndex, 0);
+	}
+
+	// --- Baking ---------------------------------------------------------------------------------
+	const double SampleRate = 30.0;
+
+	TArray<FTransform> Keys;
+	if (!TestTrue(TEXT("Bone1's track baked"),
+		Scene->GetBakedAnimationTrack(0, TEXT("Bone1"), SampleRate, 0.0, 1.0, Keys)))
+	{
+		return false;
+	}
+
+	// Fence-post count: one second at 30 fps is 31 samples, the last of them at t = 1.
+	TestEqual(TEXT("One second at 30 Hz gives 31 keys"), Keys.Num(), 31);
+
+	if (Keys.Num() != 31)
+	{
+		return false;
+	}
+
+	// A clip does not animate the root, so asking for it must fail rather than silently return a
+	// static track -- otherwise an untouched bone would be baked into every animation.
+	TArray<FTransform> RootKeys;
+	TestFalse(TEXT("An unanimated bone has no track"),
+		Scene->GetBakedAnimationTrack(0, TEXT("Root"), SampleRate, 0.0, 1.0, RootKeys));
+
+	// Source translation runs from (0, 1, 0) to (2, 1, 0) along the source X axis. Under
+	// Unreal.X = -Source.Z, Unreal.Y = Source.X, Unreal.Z = Source.Y that is (0, 0, 1) to (0, 2, 1).
+	const FVector ExpectedStart(0.0, 0.0, 1.0);
+	const FVector ExpectedMiddle(0.0, 1.0, 1.0);
+	const FVector ExpectedEnd(0.0, 2.0, 1.0);
+
+	AddInfo(FString::Printf(TEXT("Baked translations: first %s, middle %s, last %s"),
+		*Keys[0].GetTranslation().ToString(),
+		*Keys[15].GetTranslation().ToString(),
+		*Keys.Last().GetTranslation().ToString()));
+
+	TestTrue(FString::Printf(TEXT("First key sits at the start pose (got %s)"),
+			*Keys[0].GetTranslation().ToString()),
+		Keys[0].GetTranslation().Equals(ExpectedStart, UE_KINDA_SMALL_NUMBER));
+
+	TestTrue(FString::Printf(TEXT("Last key sits at the end pose (got %s)"),
+			*Keys.Last().GetTranslation().ToString()),
+		Keys.Last().GetTranslation().Equals(ExpectedEnd, UE_KINDA_SMALL_NUMBER));
+
+	// Key 15 of 31 is exactly halfway. With only two source keys, hitting the midpoint proves the
+	// samples are interpolated rather than snapped to the nearest stored key.
+	TestTrue(FString::Printf(TEXT("Halfway key is interpolated (got %s)"),
+			*Keys[15].GetTranslation().ToString()),
+		Keys[15].GetTranslation().Equals(ExpectedMiddle, UE_KINDA_SMALL_NUMBER));
+
+	// The rotation. At the end of the clip the source transform is a quarter turn about the source's
+	// up axis, applied after the translation. Rather than assert a quaternion -- whose sign and axis
+	// under an orientation-reversing basis change are exactly the thing that is easy to reason about
+	// wrongly -- assert the property that must hold for any correct conversion:
+	//
+	//     Convert(SourceTransform * p) == Convert(SourceTransform) * Convert(p)
+	//
+	// Take the source point (1, 0, 0). The quarter turn about +Y sends it to (0, 0, -1), and the
+	// translation puts it at (2, 1, -1). Converting that point gives Unreal (1, 2, 1).
+	const FVector SourcePointConverted(0.0, 1.0, 0.0);   // source (1, 0, 0)
+	const FVector ExpectedPointConverted(1.0, 2.0, 1.0); // source (2, 1, -1)
+
+	const FVector ActualPoint = Keys.Last().TransformPosition(SourcePointConverted);
+
+	TestTrue(FString::Printf(
+			TEXT("The baked rotation moves a point the way the source transform does ")
+			TEXT("(expected %s, got %s)"),
+			*ExpectedPointConverted.ToString(), *ActualPoint.ToString()),
+		ActualPoint.Equals(ExpectedPointConverted, 0.001));
+
+	// Scale is untouched by the clip, so it must come through as the node's own.
+	TestTrue(FString::Printf(TEXT("Scale is left alone (got %s)"),
+			*Keys.Last().GetScale3D().ToString()),
+		Keys.Last().GetScale3D().Equals(FVector::OneVector, 0.001));
+
+	// --- Requesting a sub-range -----------------------------------------------------------------
+	// The editor import path lets the user narrow the range, so the second half of the clip must
+	// start where the halfway sample was rather than restarting from the beginning.
+	TArray<FTransform> HalfKeys;
+	if (TestTrue(TEXT("Second half of the clip baked"),
+		Scene->GetBakedAnimationTrack(0, TEXT("Bone1"), SampleRate, 0.5, 1.0, HalfKeys)))
+	{
+		TestEqual(TEXT("Half a second at 30 Hz gives 16 keys"), HalfKeys.Num(), 16);
+		if (HalfKeys.Num() > 0)
+		{
+			TestTrue(FString::Printf(TEXT("Sub-range starts at the halfway pose (got %s)"),
+					*HalfKeys[0].GetTranslation().ToString()),
+				HalfKeys[0].GetTranslation().Equals(ExpectedMiddle, UE_KINDA_SMALL_NUMBER));
+		}
+	}
+
+	// --- The same scene in a second format -------------------------------------------------------
+	// Collada states its timebase in seconds where glTF states it in milliseconds, and Assimp hands
+	// its matrix-valued channels back already decomposed rather than as separate key arrays. Reading
+	// the same motion out of both is what shows the conversion is reasoning about the timebase
+	// rather than having been tuned to one format's idea of it.
+	{
+		const FString ColladaPath = AssimpTestUtils::GetTestDataPath(TEXT("SkinnedQuad.dae"));
+
+		FAssimpLoadResult ColladaResult;
+		const TSharedPtr<FAssimpScene> ColladaScene =
+			FAssimpScene::LoadFromFile(ColladaPath, Settings, ColladaResult);
+
+		if (TestTrue(FString::Printf(TEXT("SkinnedQuad.dae loaded (%s)"), *ColladaResult.ErrorMessage),
+			ColladaScene.IsValid()))
+		{
+			const FAssimpSceneInfo& ColladaInfo = ColladaScene->GetSceneInfo();
+
+			if (TestEqual(TEXT("Collada fixture has one clip"), ColladaInfo.Animations.Num(), 1))
+			{
+				AddInfo(FString::Printf(TEXT("Collada clip '%s': %.4fs, ticks/second %.1f"),
+					*ColladaInfo.Animations[0].Name,
+					ColladaInfo.Animations[0].DurationSeconds,
+					ColladaInfo.Animations[0].TicksPerSecond));
+
+				TestTrue(FString::Printf(TEXT("Collada clip is one second long (got %.4f)"),
+						ColladaInfo.Animations[0].DurationSeconds),
+					FMath::IsNearlyEqual(ColladaInfo.Animations[0].DurationSeconds, 1.0f, 0.01f));
+			}
+
+			TestEqual(TEXT("Collada fixture has one skinned mesh group"),
+				ColladaInfo.SkinnedMeshGroups.Num(), 1);
+
+			TArray<FTransform> ColladaKeys;
+			if (TestTrue(TEXT("Collada Bone1 track baked"),
+				ColladaScene->GetBakedAnimationTrack(0, TEXT("Bone1"), SampleRate, 0.0, 1.0, ColladaKeys))
+				&& ColladaKeys.Num() > 1)
+			{
+				AddInfo(FString::Printf(TEXT("Collada baked translations: first %s, last %s (%d keys)"),
+					*ColladaKeys[0].GetTranslation().ToString(),
+					*ColladaKeys.Last().GetTranslation().ToString(),
+					ColladaKeys.Num()));
+
+				TestTrue(FString::Printf(TEXT("Collada first key matches the glTF fixture (got %s)"),
+						*ColladaKeys[0].GetTranslation().ToString()),
+					ColladaKeys[0].GetTranslation().Equals(ExpectedStart, 0.001));
+
+				TestTrue(FString::Printf(TEXT("Collada last key matches the glTF fixture (got %s)"),
+						*ColladaKeys.Last().GetTranslation().ToString()),
+					ColladaKeys.Last().GetTranslation().Equals(ExpectedEnd, 0.001));
+			}
+		}
+	}
+
+	// --- Disabling animation import --------------------------------------------------------------
+	{
+		FAssimpImportSettings NoAnimations = Settings;
+		NoAnimations.bImportAnimations = false;
+
+		FAssimpLoadResult QuietResult;
+		const TSharedPtr<FAssimpScene> QuietScene =
+			FAssimpScene::LoadFromFile(FilePath, NoAnimations, QuietResult);
+
+		if (TestTrue(TEXT("Scene loads with animation import disabled"), QuietScene.IsValid()))
+		{
+			TestEqual(TEXT("No clips are described when animation import is off"),
+				QuietScene->GetSceneInfo().Animations.Num(), 0);
+			TestTrue(TEXT("Skinning is unaffected by disabling animation"),
+				QuietScene->GetSceneInfo().SkinnedMeshGroups.Num() == 1);
+		}
+	}
+
+	return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS

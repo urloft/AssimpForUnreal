@@ -50,6 +50,7 @@ THIRD_PARTY_INCLUDES_START
 #include "assimp/DefaultLogger.hpp"
 #include "assimp/ProgressHandler.hpp"
 
+#include "assimp/anim.h"
 #include "assimp/camera.h"
 #include "assimp/light.h"
 #include "assimp/material.h"

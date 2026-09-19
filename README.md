@@ -20,7 +20,7 @@ editor behaves identically at runtime.
 
 ## Status
 
-Assimp **6.0.5** · Unreal Engine **5.8** · **Win64** · 15 automation tests plus a ~440-file corpus sweep, all passing.
+Assimp **6.0.5** · Unreal Engine **5.8** · **Win64** · 18 automation tests plus a ~400-file corpus sweep, all passing.
 
 This is a **beta**. What works and what does not:
 
@@ -28,14 +28,14 @@ This is a **beta**. What works and what does not:
 |---|---|
 | Static meshes — positions, normals, tangents, up to 8 UV channels, vertex colours | **Working** |
 | Coordinate and unit conversion (handedness, winding, V-flip, unit scale) | **Working**, verified against exact expected values |
-| Materials → `UMaterialInstance` (base colour, metallic, roughness, emissive, opacity, two-sided) | **Working** |
+| Materials → `UMaterialInstance` (base colour, metallic, roughness, **specular**, emissive, opacity, two-sided) | **Working** |
 | Textures — external files and textures embedded in the source file | **Working** |
 | Scene hierarchy → actor/component hierarchy | **Working** |
 | Editor import via Interchange → real saved assets | **Working** |
 | Runtime import → `UDynamicMeshComponent`, sync and async, progress + cancel | **Working** |
-| Skeletons — bone hierarchy, reference pose, skin weights | **Working** (mesh side) |
+| Skeletons → `USkeleton` + `USkeletalMesh` — hierarchy, reference pose, skin weights | **Working** |
+| **Animation → `UAnimSequence`** — baked bone tracks | **Working** |
 | Cameras and lights — described in the scene data | **Working** |
-| **Animation → `UAnimSequence`** | **Not implemented** |
 | **Morph targets** | **Not implemented** |
 | Cameras/lights spawned as components by the runtime API | **Not implemented** (data is exposed; spawning is not) |
 | Linux, macOS, Android, iOS | **Not supported** — layout is per-platform, but only Win64 binaries are built |
@@ -43,12 +43,24 @@ This is a **beta**. What works and what does not:
 
 ### On animation
 
-Skinned *geometry* imports: bones, hierarchy, reference pose and per-vertex weights are all
-reconstructed and verified. What is missing is turning `aiAnimation` into a `UAnimSequence`, which in
-Interchange means the joint-node plus animation-track-set plumbing and a baked-transform payload
-provider, with bind-pose and time-range handling to match. That is a substantial piece of work in its
-own right and it is not started. It is called out here rather than half-built because a subtly wrong
-animation import is far harder to diagnose than an absent one.
+An animated, skinned file imports as a `USkeleton`, a `USkeletalMesh` and a `UAnimSequence` per clip.
+Bone tracks are **baked**: Assimp hands back three independent key arrays per node -- position,
+rotation and scale, each with its own times and no interpolation mode -- while Unreal stores one
+transform per bone per frame, so the three are evaluated at common frame times. That is what
+Interchange asks a translator for, and it is the honest translation rather than a lossy shortcut.
+
+Two details are worth knowing because they are where this usually goes wrong:
+
+- **Ticks per second is a timebase, not a frame rate.** glTF counts in milliseconds (1000), Collada
+  in seconds (1). Reading either as a frame rate would bake a glTF clip at 1000 fps and a Collada
+  clip at 1 fps, so the declared value is used only when it is plausibly a frame rate and 30 Hz is
+  used otherwise. Formats that do state one, such as BVH, are honoured.
+- **The coordinate change of basis is a conjugation.** Converting a key's translation, rotation and
+  scale separately gives a different rotation axis and a character whose limbs bend the wrong way.
+  Each key is recomposed into a matrix and put through the same conversion the reference pose used.
+
+Still missing: **morph targets**. A clip that also animates morph or mesh channels imports its bone
+tracks and says so in the import report rather than dropping them silently.
 
 ---
 
@@ -63,7 +75,7 @@ animation import is far harder to diagnose than an absent one.
 
 ```bash
 git lfs install
-git clone <this-repo> YourProject/Plugins/AssimpForUnreal
+git clone https://github.com/urloft/AssimpForUnreal.git YourProject/Plugins/AssimpForUnreal
 git -C YourProject/Plugins/AssimpForUnreal lfs pull
 ```
 
@@ -256,11 +268,14 @@ set ASSIMP_CORPUS_DIR=C:/path/to/assimp/test/models
 ```
 
 ```bash
-"C:/Program Files/Epic Games/UE_5.8/Engine/Binaries/Win64/UnrealEditor-Cmd.exe" YourProject.uproject -ExecCmds="Automation RunTests AssimpHost.Corpus.Sweep; Quit" -unattended -nullrhi -nosplash -NoSound -NoPause
+"C:/Program Files/Epic Games/UE_5.8/Engine/Binaries/Win64/UnrealEditor-Cmd.exe" YourProject.uproject -ExecCmds="Automation RunTests AssimpForUnreal.Corpus.Sweep" -TestExit="Automation Test Queue Empty" -unattended -nullrhi -nosplash -NoSound -NoPause
 ```
 
-Run it **separately** from the unit tests — it loads ~440 files and is long enough that bundling it
+Run it **separately** from the unit tests — it loads ~400 files and is long enough that bundling it
 into one run truncates the others.
+
+`-TestExit` rather than a `; Quit` appended to `-ExecCmds`: the Quit runs immediately, so the session
+ends before a single test does and the run reports nothing at all rather than failing.
 
 This is worth doing after any change to the conversion path. It found three crashes the
 hand-written fixtures did not:
@@ -277,10 +292,10 @@ fixtures, formats requiring absent external files, and encodings Assimp cannot r
 
 
 ```bash
-"C:/Program Files/Epic Games/UE_5.8/Engine/Binaries/Win64/UnrealEditor-Cmd.exe" YourProject.uproject -ExecCmds="Automation RunTests AssimpForUnreal; Quit" -unattended -nullrhi -nosplash -NoSound
+"C:/Program Files/Epic Games/UE_5.8/Engine/Binaries/Win64/UnrealEditor-Cmd.exe" YourProject.uproject -ExecCmds="Automation RunTests AssimpForUnreal" -TestExit="Automation Test Queue Empty" -unattended -nullrhi -nosplash -NoSound
 ```
 
-13 tests across three groups. The fixtures in `Tests/Data` are hand-authored ASCII (or generated by a
+18 tests across four groups. The fixtures in `Tests/Data` are hand-authored ASCII (or generated by a
 committed script) so their expected values can be derived by reading them.
 
 The tests deliberately assert geometry, not just success. A handedness or winding mistake still
@@ -293,7 +308,18 @@ produces a mesh with the right triangle count, so counting triangles proves noth
 - `Core.UVsAndMaterials` — the quad's explicit flat normal `(0,0,1)` must convert to `(-1,0,0)` *and*
   agree with the winding-implied normal.
 - `Core.SkinnedMesh` — a joint translated `(0,1,0)` in the source must land at `(0,0,1)` in Unreal.
+- `Core.Animation` — a baked key applied to a converted point must give the same answer as converting
+  the point the source transform produces. That identity holds only if the change of basis was
+  applied as a conjugation; remapping the translation alone passes any translation-only clip and
+  fails this one.
+- `Core.MaterialSpecular` — a white Phong `Ks`, which is what an exporter writes when nobody chose
+  anything, must land on Unreal's neutral `Specular` of 0.5 and leave the model looking untouched;
+  the specular exponent must order two materials the way the file does.
 - `Interchange.ImportStaticMesh` — a `.ply` becomes a real `UStaticMesh` with its topology intact.
+- `Interchange.ImportSkeletalAnimation` — a `.dae` becomes a `USkeleton`, a `USkeletalMesh` and a
+  `UAnimSequence` whose bone track moves the right way. Collada rather than glTF on purpose:
+  Interchange picks a translator by iterating a set, so where the engine claims the same extension
+  the winner is unspecified and the test would prove nothing about this plugin.
 
 ### Packaging is also a test
 
@@ -332,9 +358,9 @@ grep -r '#include "assimp/' Source --include=*.h    # must match only AssimpIncl
 | Scene lifetime | Raw `aiScene*` in a `UObject`, manual `BeginDestroy` | RAII, `TSharedPtr`, pointer never exposed |
 | Custom file IO | No | Yes, over Unreal's `IFileManager` |
 | Progress / cancellation | No | Yes, both |
-| Automated tests | No | 11 |
+| Automated tests | No | 18 |
 | Runtime Blueprint import | Yes | Yes |
-| Animation import | Partial | **Not implemented** (see Status) |
+| Animation import | Partial | Yes — baked bone tracks to `UAnimSequence` |
 | Platforms | Win64, Mac, Linux, Android | Win64 only |
 
 Two concrete defects in that plugin this one avoids by construction:
@@ -348,7 +374,7 @@ Two concrete defects in that plugin this one avoids by construction:
   silently falls back to the default search order — which is the classic reason a plugin works
   in-editor and then cannot find its DLL in a packaged build.
 
-Where `UE4_Assimp` is still ahead: platform coverage, and some animation support.
+Where `UE4_Assimp` is still ahead: platform coverage.
 
 ---
 

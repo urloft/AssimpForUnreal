@@ -13,8 +13,8 @@
 *.umap   filter=lfs diff=lfs merge=lfs -text
 
 # Sample models used by the automation tests.
-# Only binary formats go to LFS. The hand-authored ASCII fixtures (.ply, .obj, .mtl, .stl)
-# stay as ordinary text so they remain readable and diffable in review -- they are the
+# Only binary formats go to LFS. The hand-authored ASCII fixtures (.ply, .obj, .mtl, .stl, .dae,
+# .gltf) stay as ordinary text so they remain readable and diffable in review -- they are the
 # specification of the expected conversion results, so being able to read them matters.
 Tests/Data/**/*.glb  filter=lfs diff=lfs merge=lfs -text
 Tests/Data/**/*.fbx  filter=lfs diff=lfs merge=lfs -text

@@ -147,6 +147,11 @@ namespace AssimpRuntimePrivate
 				Instance->SetScalarParameterValue(TEXT("Roughness"), Material.Roughness);
 				Instance->SetScalarParameterValue(TEXT("Opacity"), Material.Opacity);
 
+				// Specular is normal-incidence reflectance / 0.08 in Unreal, so 0.5 is the neutral
+				// dielectric value rather than "half". FAssimpMaterialInfo already carries it in
+				// that convention, whatever the source model used, so it passes straight through.
+				Instance->SetScalarParameterValue(TEXT("Specular"), Material.Specular);
+
 				// Textures, keyed by the parameter names the base material is expected to expose.
 				// Loading is lazy and cached per source image inside the scene object, so a model
 				// whose many materials share a few images decodes each image once.
@@ -170,6 +175,7 @@ namespace AssimpRuntimePrivate
 					{ EAssimpTextureSlot::Normal,           TEXT("NormalTexture"),    nullptr /* flat-normal default is the no-op */ },
 					{ EAssimpTextureSlot::Roughness,        TEXT("RoughnessTexture"), TEXT("UseRoughnessTexture") },
 					{ EAssimpTextureSlot::Metallic,         TEXT("MetallicTexture"),  TEXT("UseMetallicTexture")  },
+					{ EAssimpTextureSlot::Specular,         TEXT("SpecularTexture"),  TEXT("UseSpecularTexture")  },
 					{ EAssimpTextureSlot::AmbientOcclusion, TEXT("OcclusionTexture"), TEXT("UseOcclusionTexture") },
 					{ EAssimpTextureSlot::Emissive,         TEXT("EmissiveTexture"),  TEXT("UseEmissiveTexture")  },
 				};

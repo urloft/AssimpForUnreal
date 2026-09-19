@@ -102,6 +102,29 @@ struct ASSIMPCORE_API FAssimpMaterialInfo
 	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Material")
 	float Roughness = 0.5f;
 
+	/**
+	 * Unreal's specular input: how reflective the surface is where it is not metallic.
+	 *
+	 * 0.5 is Unreal's neutral value and corresponds to the 4% normal-incidence reflectance every
+	 * dielectric has, so a material that says nothing about specularity must arrive at exactly 0.5.
+	 * Anything else silently changes the look of every model that does not use the channel.
+	 *
+	 * See FAssimpScene's material conversion for how the source file's specular colour, specular
+	 * factor and shininess strength are folded into this one scalar.
+	 */
+	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Material")
+	float Specular = 0.5f;
+
+	/**
+	 * Specular tint exactly as the file declared it, before it was reduced to the Specular scalar.
+	 *
+	 * Unreal's default shading model has no coloured-specular input for dielectrics -- metals take
+	 * their tint from base colour instead -- so this is carried for inspection and for callers
+	 * driving their own material, not because the plugin's own materials consume it.
+	 */
+	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Material")
+	FLinearColor SpecularColor = FLinearColor::White;
+
 	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Material")
 	float Opacity = 1.0f;
 
@@ -191,6 +214,103 @@ struct ASSIMPCORE_API FAssimpNodeInfo
 	/** Format-specific metadata attached to this node, flattened to strings. */
 	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Node")
 	TMap<FString, FString> Metadata;
+};
+
+/**
+ * One bone of a skeleton reconstructed from the loose bone references in a file.
+ *
+ * Assimp hands back no skeleton: each mesh carries a flat list of named bones, and the hierarchy
+ * that relates them is mixed into the node tree with everything else. These are the result of
+ * putting that back together -- ordered the way Unreal requires, parents strictly before children.
+ */
+USTRUCT(BlueprintType)
+struct ASSIMPCORE_API FAssimpSkeletonBone
+{
+	GENERATED_BODY()
+
+	/** Bone name, matching both the node and the bone reference it was reconstructed from. */
+	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Skeleton")
+	FString Name;
+
+	/** Index of the parent in the containing array, or INDEX_NONE for the root. Always smaller than this bone's index. */
+	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Skeleton")
+	int32 ParentIndex = INDEX_NONE;
+
+	/** Transform relative to the parent bone, in Unreal space. Together these form the reference pose. */
+	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Skeleton")
+	FTransform LocalTransform = FTransform::Identity;
+
+	/**
+	 * True when a mesh actually skins to this bone.
+	 *
+	 * False for a bone included only because it lies between the root and a bone that is skinned to.
+	 * Those must exist to carry their transforms, but nothing is weighted to them.
+	 */
+	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Skeleton")
+	bool bIsSkinningBone = false;
+};
+
+/**
+ * A skeleton together with every skinned mesh bound to it.
+ *
+ * Assimp describes skinning per mesh, so several meshes of one character are several independent
+ * bone lists that happen to name the same nodes. Unreal needs the opposite grouping: one skeleton,
+ * and the meshes that share it. Reconciling the two is what this struct records -- and it is also
+ * what animation needs, since an animation clip targets a skeleton rather than a mesh.
+ */
+USTRUCT(BlueprintType)
+struct ASSIMPCORE_API FAssimpSkinnedMeshGroup
+{
+	GENERATED_BODY()
+
+	/** Name of the node the skeleton is rooted at. Also Bones[0].Name. */
+	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Skeleton")
+	FString RootBoneName;
+
+	/** The skeleton, parents before children. */
+	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Skeleton")
+	TArray<FAssimpSkeletonBone> Bones;
+
+	/** Indices into FAssimpSceneInfo::Meshes of every mesh skinned to this skeleton. */
+	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Skeleton")
+	TArray<int32> MeshIndices;
+};
+
+/** An animation clip defined in the source file. */
+USTRUCT(BlueprintType)
+struct ASSIMPCORE_API FAssimpAnimationInfo
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Animation")
+	FString Name;
+
+	/** Length in seconds, after converting the file's ticks. Never negative. */
+	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Animation")
+	float DurationSeconds = 0.0f;
+
+	/**
+	 * Ticks per second the file declared, or 0 when it declared none.
+	 *
+	 * Reported unconverted because it is diagnostic rather than directive: it is a timebase, not a
+	 * frame rate, and treating it as one is wrong for most formats. glTF stores milliseconds
+	 * (1000), Collada stores seconds (1). See FAssimpScene::GetAnimationSampleRate.
+	 */
+	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Animation")
+	float TicksPerSecond = 0.0f;
+
+	/** Names of the nodes this clip animates, in the file's order. */
+	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Animation")
+	TArray<FString> AnimatedNodeNames;
+
+	/**
+	 * True when the clip also carries mesh or morph-mesh channels.
+	 *
+	 * Those are not imported. Surfacing the fact is the point: a clip that only deforms morph
+	 * targets otherwise imports as an empty animation with no explanation.
+	 */
+	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Animation")
+	bool bHasMeshOrMorphChannels = false;
 };
 
 /** A camera defined in the source file. */
@@ -295,9 +415,9 @@ struct ASSIMPCORE_API FAssimpSceneInfo
 	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Scene")
 	int32 NumEmbeddedTextures = 0;
 
-	/** Names of every animation clip in the file. */
+	/** Every animation clip in the file. Empty when animation import is disabled. */
 	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Scene")
-	TArray<FString> AnimationNames;
+	TArray<FAssimpAnimationInfo> Animations;
 
 	/** Unit scale the file declared, before conversion to centimetres. 1.0 when unspecified. */
 	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Scene")
@@ -314,4 +434,15 @@ struct ASSIMPCORE_API FAssimpSceneInfo
 	/** True when any mesh in the scene carries skin weights. */
 	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Scene")
 	bool bHasSkinnedMeshes = false;
+
+	/**
+	 * Skeletons reconstructed from the scene, each with the meshes skinned to it.
+	 *
+	 * Empty when skeletal import is disabled or nothing in the file is skinned. Built during the
+	 * initial description pass rather than on demand because both consumers need it before they
+	 * request any geometry: the editor import has to emit joint nodes while building its node
+	 * graph, and animation is addressed per skeleton.
+	 */
+	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Scene")
+	TArray<FAssimpSkinnedMeshGroup> SkinnedMeshGroups;
 };

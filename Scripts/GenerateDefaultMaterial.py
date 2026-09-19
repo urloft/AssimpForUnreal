@@ -185,6 +185,17 @@ def make_material():
     b.to_property(b.lerp(rough_val, "", rough_tex, "R", use_rough, 2, 6), "",
                   unreal.MaterialProperty.MP_ROUGHNESS)
 
+    # --- Specular ----------------------------------------------------------------------------
+    # Unreal's Specular input is normal-incidence reflectance / 0.08, so its neutral value is 0.5 --
+    # the 4% every dielectric reflects -- not 1.0. Defaulting this parameter to anything else would
+    # change the look of every model that says nothing about specularity.
+    spec_tex = b.sampler("SpecularTexture", "8 - Specular",
+                         unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR, TEX_LINEAR, 0, 24)
+    use_spec = b.scalar("UseSpecularTexture", "8 - Specular", 0.0, 0, 25)
+    spec_val = b.scalar("Specular", "8 - Specular", 0.5, 0, 26)
+    b.to_property(b.lerp(spec_val, "", spec_tex, "R", use_spec, 2, 24), "",
+                  unreal.MaterialProperty.MP_SPECULAR)
+
     # --- Metallic ----------------------------------------------------------------------------
     metal_tex = b.sampler("MetallicTexture", "4 - Metallic",
                           unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR, TEX_LINEAR, 0, 10)

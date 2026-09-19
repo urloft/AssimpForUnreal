@@ -1,0 +1,24 @@
+# AssimpForUnreal test fixture: two materials that differ only in their specular response.
+#
+# Ks is the Phong specular colour and Ns the specular exponent. Neither has a PBR counterpart in the
+# file, so these are exactly the inputs the conversion has to reason about, and the pair is chosen so
+# that a mapping which ignored either one would be visible in the results:
+#
+#   MatShiny  Ks white       -> the ordinary dielectric response, Unreal's Specular 0.5
+#             Ns 200         -> a tight highlight, so low roughness
+#   MatDull   Ks 0.2 grey    -> a fifth of that response, Specular 0.1
+#             Ns 4           -> a broad highlight, so roughness above the 0.5 default
+#
+# illum 2 declares the Phong model, which is what makes Ks meaningful at all.
+
+newmtl MatShiny
+Kd 0.800000 0.800000 0.800000
+Ks 1.000000 1.000000 1.000000
+Ns 200.000000
+illum 2
+
+newmtl MatDull
+Kd 0.800000 0.800000 0.800000
+Ks 0.200000 0.200000 0.200000
+Ns 4.000000
+illum 2

@@ -4,6 +4,7 @@
 
 #include "AssimpAxisConverter.h"
 #include "AssimpIncludes.h"
+#include "AssimpSceneTypes.h"
 #include "CoreMinimal.h"
 
 /**
@@ -28,27 +29,14 @@
 class FAssimpSkeletonBuilder
 {
 public:
-	/** One bone in the reconstructed skeleton. */
-	struct FBone
-	{
-		/** Bone name, matching the aiNode and aiBone name it came from. */
-		FString Name;
-
-		/** Index of the parent in Bones, or INDEX_NONE for the root. Always less than this bone's index. */
-		int32 ParentIndex = INDEX_NONE;
-
-		/** Transform relative to the parent bone, in Unreal space. Forms the reference pose. */
-		FTransform LocalTransform;
-
-		/**
-		 * True when a mesh actually skins to this bone.
-		 *
-		 * False for a node included only because it lies on the path between the root and a real
-		 * bone. Such nodes must exist in the skeleton to carry their transforms, but nothing is
-		 * weighted to them.
-		 */
-		bool bIsSkinningBone = false;
-	};
+	/**
+	 * One bone in the reconstructed skeleton.
+	 *
+	 * The public type, not a private twin of it: the skeleton this builder reconstructs is handed
+	 * out through FAssimpScene, and having one definition is what keeps the reference pose the
+	 * editor import sees identical to the one the skin weights were written against.
+	 */
+	using FBone = FAssimpSkeletonBone;
 
 	/**
 	 * Builds a skeleton covering every bone the given meshes reference.

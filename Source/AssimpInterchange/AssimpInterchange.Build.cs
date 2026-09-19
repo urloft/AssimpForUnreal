@@ -47,6 +47,11 @@ public class AssimpInterchange : ModuleRules
 			new string[]
 			{
 				"InterchangeCommon",
+
+				// FAnimationPayloadData and FAnimationPayloadQuery, the shapes Interchange wants
+				// baked animation handed back in.
+				"InterchangeCommonParser",
+
 				"InterchangeMessages",
 				"SkeletalMeshDescription",
 

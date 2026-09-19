@@ -2,6 +2,7 @@
 
 #include "AssimpScene.h"
 
+#include "AssimpAnimationConverter.h"
 #include "AssimpAxisConverter.h"
 #include "AssimpBridges.h"
 #include "AssimpCore.h"
@@ -9,6 +10,7 @@
 #include "AssimpMeshConverter.h"
 #include "AssimpPostProcess.h"
 #include "AssimpReadGuard.h"
+#include "AssimpSkeletonBuilder.h"
 
 #include "HAL/FileManager.h"
 #include "MeshDescription.h"
@@ -174,6 +176,103 @@ namespace
 		aiTextureType_REFLECTION,
 	};
 
+	/**
+	 * Fills in a material's specular response and roughness.
+	 *
+	 * Both channels, together, because they are the same question asked twice and the answer to each
+	 * depends on what the file said about the other. Three material models reach us:
+	 *
+	 *   - Metallic/roughness (glTF, modern FBX): roughness is stated outright, and a specular factor
+	 *     may be present from KHR_materials_specular.
+	 *   - Specular/glossiness (older glTF extension, some FBX): glossiness is roughness inverted.
+	 *   - Phong (OBJ, 3DS, Collada, DXF, and most of the older formats): neither exists. There is a
+	 *     specular colour Ks and a specular exponent Ns, and nothing else.
+	 *
+	 * The Phong case is the one that matters in practice, because it is most of the file formats
+	 * this plugin exists to read. Left alone it produces the plugin's default roughness of 0.5 on
+	 * every material in the file, so a polished and a matte surface arrive identical and no model
+	 * has a specular highlight anywhere near where its author put one.
+	 *
+	 * Specular strength to Unreal's Specular input
+	 * --------------------------------------------
+	 * Unreal's Specular is not a gain -- it is normal-incidence reflectance divided by 0.08, so 0.5
+	 * means the 4% every dielectric reflects. That fixes the mapping rather than leaving it to
+	 * taste: glTF's specularFactor scales exactly that 4%, so Specular = 0.5 * factor, and the same
+	 * formula applied to a Phong Ks makes white -- overwhelmingly the most common value, and usually
+	 * just the exporter's default -- mean "an ordinary dielectric" and leave the model untouched.
+	 *
+	 * Mapping Ks straight onto Specular instead, as some importers do, doubles the reflectance of
+	 * every OBJ that has never expressed an opinion about it.
+	 */
+	void ExtractSpecularAndRoughness(const aiMaterial& Material, FAssimpMaterialInfo& Info)
+	{
+		float Scalar = 0.0f;
+
+		// --- Roughness -------------------------------------------------------------------------
+		if (Material.Get(AI_MATKEY_ROUGHNESS_FACTOR, Scalar) == AI_SUCCESS)
+		{
+			Info.Roughness = FMath::Clamp(Scalar, 0.0f, 1.0f);
+		}
+		else if (Material.Get(AI_MATKEY_GLOSSINESS_FACTOR, Scalar) == AI_SUCCESS)
+		{
+			Info.Roughness = FMath::Clamp(1.0f - Scalar, 0.0f, 1.0f);
+		}
+		else if (Material.Get(AI_MATKEY_SHININESS, Scalar) == AI_SUCCESS && Scalar > 0.0f)
+		{
+			// Blinn-Phong exponent to roughness. Both describe the width of the specular lobe, and
+			// alpha = sqrt(2 / (exponent + 2)) is the standard correspondence between them -- the
+			// same one used to convert legacy content in every renderer that has had to do it.
+			//
+			// The exponent is unbounded and formats disagree wildly on its range (OBJ goes to 1000,
+			// 3DS to 128), which is precisely why a curve derived from the lobe width is used rather
+			// than a linear remap of some assumed maximum.
+			const float Exponent = FMath::Min(Scalar, 8192.0f);
+			Info.Roughness = FMath::Clamp(FMath::Sqrt(2.0f / (Exponent + 2.0f)), 0.0f, 1.0f);
+		}
+
+		// --- Specular --------------------------------------------------------------------------
+		aiColor4D Color;
+		const bool bHasSpecularColor = Material.Get(AI_MATKEY_COLOR_SPECULAR, Color) == AI_SUCCESS;
+		if (bHasSpecularColor)
+		{
+			Info.SpecularColor = FAssimpAxisConverter::ConvertColor(Color);
+		}
+
+		// A stated specular factor is authoritative: it is defined against the same 4% baseline
+		// Unreal's Specular is, so it needs no interpretation.
+		float Strength = 1.0f;
+		bool bHaveStrength = false;
+
+		if (Material.Get(AI_MATKEY_SPECULAR_FACTOR, Scalar) == AI_SUCCESS && FMath::IsFinite(Scalar))
+		{
+			Strength = Scalar;
+			bHaveStrength = true;
+		}
+		else if (bHasSpecularColor)
+		{
+			// Phong Ks. Its luminance is the only defensible scalar to take from a colour that
+			// Unreal's dielectric specular has no way to tint.
+			Strength = static_cast<float>(Info.SpecularColor.GetLuminance());
+			bHaveStrength = true;
+
+			// Shininess strength (3DS "shininess percent", FBX specular factor) scales Ks where a
+			// format carries it separately.
+			if (Material.Get(AI_MATKEY_SHININESS_STRENGTH, Scalar) == AI_SUCCESS
+				&& FMath::IsFinite(Scalar)
+				&& Scalar >= 0.0f)
+			{
+				Strength *= Scalar;
+			}
+		}
+
+		if (bHaveStrength)
+		{
+			// Clamped to [0, 2] before halving: Unreal's Specular saturates at 1 anyway, and a file
+			// declaring a specular colour far above white should not be able to drive it further.
+			Info.Specular = 0.5f * FMath::Clamp(Strength, 0.0f, 2.0f);
+		}
+	}
+
 	/** Maps Assimp's light type onto ours. */
 	EAssimpLightType ConvertLightType(aiLightSourceType Type)
 	{
@@ -219,6 +318,15 @@ struct FAssimpScene::FImpl
 	/** Directory of the source file, used to resolve relative texture paths. */
 	FString BaseDirectory;
 
+	/**
+	 * The clip at an index into SceneInfo.Animations, or null.
+	 *
+	 * SceneInfo.Animations is built in aiScene order and never filtered, so the two index the same
+	 * clips -- but only when animation import is on, which is why the bound check is against the
+	 * scene rather than against the description.
+	 */
+	const aiAnimation* FindAnimation(int32 AnimationIndex) const;
+
 	/** Builds SceneInfo from the parsed scene. */
 	void BuildSceneInfo();
 
@@ -226,6 +334,8 @@ struct FAssimpScene::FImpl
 	void BuildMeshes();
 	void BuildNodeHierarchy();
 	void BuildCamerasAndLights();
+	void BuildAnimations();
+	void BuildSkinnedMeshGroups();
 
 	/** Recursive helper for BuildNodeHierarchy. */
 	int32 AddNodeRecursive(const aiNode* Node, int32 ParentIndex, int32 Depth);
@@ -447,7 +557,7 @@ TSharedPtr<FAssimpScene> FAssimpScene::LoadInternal(
 		Impl.SceneInfo.Nodes.Num(),
 		Impl.SceneInfo.Meshes.Num(),
 		Impl.SceneInfo.Materials.Num(),
-		Impl.SceneInfo.AnimationNames.Num());
+		Impl.SceneInfo.Animations.Num());
 
 	// Warn when the result is so small it will look like nothing imported.
 	//
@@ -738,6 +848,50 @@ bool FAssimpScene::GetMergedMeshDescription(
 	return bSucceeded;
 }
 
+double FAssimpScene::GetAnimationSampleRate(int32 AnimationIndex) const
+{
+	const aiAnimation* Animation = Impl->FindAnimation(AnimationIndex);
+	if (Animation == nullptr)
+	{
+		return 0.0;
+	}
+
+	return FAssimpAnimationConverter::GetSampleRate(*Animation);
+}
+
+bool FAssimpScene::GetBakedAnimationTrack(
+	int32 AnimationIndex,
+	const FString& NodeName,
+	double SampleRateHz,
+	double RangeStartSeconds,
+	double RangeEndSeconds,
+	TArray<FTransform>& OutKeys) const
+{
+	OutKeys.Reset();
+
+	if (!Impl->AxisConverter.IsValid())
+	{
+		UE_LOG(LogAssimp, Error, TEXT("GetBakedAnimationTrack called on an unloaded scene."));
+		return false;
+	}
+
+	const aiAnimation* Animation = Impl->FindAnimation(AnimationIndex);
+	if (Animation == nullptr)
+	{
+		return false;
+	}
+
+	return FAssimpAnimationConverter::SampleNodeTrack(
+		*Impl->Scene,
+		*Animation,
+		NodeName,
+		*Impl->AxisConverter,
+		SampleRateHz,
+		RangeStartSeconds,
+		RangeEndSeconds,
+		OutKeys);
+}
+
 bool FAssimpScene::GetEmbeddedTexture(int32 TextureIndex, FAssimpEmbeddedTexture& OutTexture) const
 {
 	if (Impl->Scene == nullptr || Impl->Scene->mTextures == nullptr)
@@ -852,6 +1006,21 @@ bool FAssimpScene::ResolveExternalTexturePath(const FString& RecordedPath, FStri
 // Scene description construction
 // =================================================================================================
 
+const aiAnimation* FAssimpScene::FImpl::FindAnimation(int32 AnimationIndex) const
+{
+	if (Scene == nullptr || Scene->mAnimations == nullptr)
+	{
+		return nullptr;
+	}
+
+	if (AnimationIndex < 0 || static_cast<unsigned int>(AnimationIndex) >= Scene->mNumAnimations)
+	{
+		return nullptr;
+	}
+
+	return Scene->mAnimations[AnimationIndex];
+}
+
 void FAssimpScene::FImpl::BuildSceneInfo()
 {
 	check(Scene != nullptr);
@@ -864,21 +1033,126 @@ void FAssimpScene::FImpl::BuildSceneInfo()
 	BuildNodeHierarchy();
 	BuildCamerasAndLights();
 
-	SceneInfo.NumEmbeddedTextures = static_cast<int32>(Scene->mNumTextures);
+	// Skeletons before animations: a clip is only worth describing once it is known which skeleton
+	// it can drive, and both are needed before any payload is requested.
+	BuildSkinnedMeshGroups();
+	BuildAnimations();
 
-	SceneInfo.AnimationNames.Reserve(static_cast<int32>(Scene->mNumAnimations));
+	SceneInfo.NumEmbeddedTextures = static_cast<int32>(Scene->mNumTextures);
+}
+
+void FAssimpScene::FImpl::BuildAnimations()
+{
+	if (!Settings.bImportAnimations || Scene->mAnimations == nullptr)
+	{
+		return;
+	}
+
+	SceneInfo.Animations.Reserve(static_cast<int32>(Scene->mNumAnimations));
+
 	for (unsigned int Index = 0; Index < Scene->mNumAnimations; ++Index)
 	{
 		const aiAnimation* Animation = Scene->mAnimations[Index];
-		FString Name = (Animation != nullptr)
+
+		FAssimpAnimationInfo Info;
+		Info.Name = (Animation != nullptr)
 			? FAssimpAxisConverter::ConvertString(Animation->mName)
 			: FString();
-		if (Name.IsEmpty())
+
+		// Unnamed clips are common -- Collada and several others never name them -- and Unreal keys
+		// the resulting asset by name, so an empty one would produce a nameless asset.
+		if (Info.Name.IsEmpty())
 		{
-			Name = FString::Printf(TEXT("Animation_%u"), Index);
+			Info.Name = FString::Printf(TEXT("Animation_%u"), Index);
 		}
-		SceneInfo.AnimationNames.Add(Name);
+
+		if (Animation != nullptr)
+		{
+			Info.DurationSeconds =
+				static_cast<float>(FAssimpAnimationConverter::GetDurationSeconds(*Animation));
+			Info.TicksPerSecond = static_cast<float>(Animation->mTicksPerSecond);
+			Info.bHasMeshOrMorphChannels =
+				Animation->mNumMeshChannels > 0 || Animation->mNumMorphMeshChannels > 0;
+
+			Info.AnimatedNodeNames.Reserve(static_cast<int32>(Animation->mNumChannels));
+			for (unsigned int ChannelIndex = 0; ChannelIndex < Animation->mNumChannels; ++ChannelIndex)
+			{
+				const aiNodeAnim* Channel =
+					(Animation->mChannels != nullptr) ? Animation->mChannels[ChannelIndex] : nullptr;
+				if (Channel != nullptr)
+				{
+					Info.AnimatedNodeNames.Add(FAssimpAxisConverter::ConvertString(Channel->mNodeName));
+				}
+			}
+		}
+
+		SceneInfo.Animations.Add(MoveTemp(Info));
 	}
+}
+
+void FAssimpScene::FImpl::BuildSkinnedMeshGroups()
+{
+	if (!Settings.bImportSkeletalMesh || !SceneInfo.bHasSkinnedMeshes)
+	{
+		return;
+	}
+
+	// Group the skinned meshes by the skeleton they belong to.
+	//
+	// Assimp describes skinning per mesh, so a character split into body and clothing is several
+	// independent bone lists that happen to name the same nodes. Unreal needs one skeletal mesh per
+	// skeleton, and an animation targets a skeleton rather than a mesh, so the grouping has to be
+	// recovered here. The skeleton builder already resolves a set of meshes to a single root, so
+	// running it per mesh first yields exactly the key to group on.
+	TMap<FString, TArray<int32>> MeshesByRootName;
+
+	for (int32 MeshIndex = 0; MeshIndex < SceneInfo.Meshes.Num(); ++MeshIndex)
+	{
+		if (!SceneInfo.Meshes[MeshIndex].bHasBones)
+		{
+			continue;
+		}
+
+		const int32 SingleMesh[1] = { MeshIndex };
+
+		FAssimpSkeletonBuilder Builder;
+		if (!Builder.Build(*Scene, SingleMesh, *AxisConverter) || Builder.GetBones().IsEmpty())
+		{
+			// Reported by the builder itself; the mesh simply imports as static geometry.
+			continue;
+		}
+
+		MeshesByRootName.FindOrAdd(Builder.GetBones()[0].Name).Add(MeshIndex);
+	}
+
+	SceneInfo.SkinnedMeshGroups.Reserve(MeshesByRootName.Num());
+
+	for (TPair<FString, TArray<int32>>& Pair : MeshesByRootName)
+	{
+		// Rebuild over the whole group rather than reusing a per-mesh skeleton: a second mesh may
+		// skin to bones the first never touches, and those must be present in the shared skeleton or
+		// its weights are dropped.
+		FAssimpSkeletonBuilder Builder;
+		if (!Builder.Build(*Scene, Pair.Value, *AxisConverter) || Builder.GetBones().IsEmpty())
+		{
+			continue;
+		}
+
+		FAssimpSkinnedMeshGroup Group;
+		Group.RootBoneName = Builder.GetBones()[0].Name;
+		Group.Bones = Builder.GetBones();
+		Group.MeshIndices = MoveTemp(Pair.Value);
+
+		SceneInfo.SkinnedMeshGroups.Add(MoveTemp(Group));
+	}
+
+	// Deterministic order, so an import of the same file twice produces the same asset names. A
+	// TMap's iteration order is not stable across runs.
+	SceneInfo.SkinnedMeshGroups.Sort(
+		[](const FAssimpSkinnedMeshGroup& A, const FAssimpSkinnedMeshGroup& B)
+		{
+			return A.MeshIndices[0] < B.MeshIndices[0];
+		});
 }
 
 void FAssimpScene::FImpl::BuildMaterials()
@@ -933,14 +1207,12 @@ void FAssimpScene::FImpl::BuildMaterials()
 		{
 			Info.Metallic = FMath::Clamp(Scalar, 0.0f, 1.0f);
 		}
-		if (Material->Get(AI_MATKEY_ROUGHNESS_FACTOR, Scalar) == AI_SUCCESS)
-		{
-			Info.Roughness = FMath::Clamp(Scalar, 0.0f, 1.0f);
-		}
 		if (Material->Get(AI_MATKEY_OPACITY, Scalar) == AI_SUCCESS)
 		{
 			Info.Opacity = FMath::Clamp(Scalar, 0.0f, 1.0f);
 		}
+
+		ExtractSpecularAndRoughness(*Material, Info);
 
 		Info.bIsTranslucent = Info.Opacity < 1.0f - UE_KINDA_SMALL_NUMBER;
 

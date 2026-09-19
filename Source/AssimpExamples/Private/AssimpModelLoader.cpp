@@ -179,7 +179,7 @@ void AAssimpModelLoader::SpawnLoadedScene(
 		Info.Nodes.Num(),
 		Info.Meshes.Num(),
 		Info.Materials.Num(),
-		Info.AnimationNames.Num(),
+		Info.Animations.Num(),
 		Info.AppliedScale);
 
 	for (int32 Index = 0; Index < Info.Meshes.Num(); ++Index)

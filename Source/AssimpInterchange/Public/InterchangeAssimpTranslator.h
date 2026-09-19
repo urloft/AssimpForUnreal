@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "Animation/InterchangeAnimationPayloadInterface.h"
 #include "CoreMinimal.h"
 #include "InterchangeTranslatorBase.h"
 #include "Mesh/InterchangeMeshPayload.h"
@@ -37,6 +38,7 @@ UCLASS(BlueprintType)
 class ASSIMPINTERCHANGE_API UInterchangeAssimpTranslator : public UInterchangeTranslatorBase
 	, public IInterchangeMeshPayloadInterface
 	, public IInterchangeTexturePayloadInterface
+	, public IInterchangeAnimationPayloadInterface
 {
 	GENERATED_BODY()
 
@@ -75,6 +77,18 @@ public:
 		TOptional<FString>& AlternateTexturePath) const override;
 	//~ End IInterchangeTexturePayloadInterface
 
+	//~ Begin IInterchangeAnimationPayloadInterface
+	/**
+	 * Bakes the requested bone tracks.
+	 *
+	 * Queries are answered one at a time rather than grouped: the answer for a bone depends only on
+	 * that bone's key arrays, so there is no shared evaluation state to amortise -- which is the only
+	 * reason PreferGroupingBoneAnimationQueriesTogether exists, and why it is left at false.
+	 */
+	virtual TArray<UE::Interchange::FAnimationPayloadData> GetAnimationPayloadData(
+		const TArray<UE::Interchange::FAnimationPayloadQuery>& PayloadQueries) const override;
+	//~ End IInterchangeAnimationPayloadInterface
+
 	/**
 	 * Prefix marking a texture payload key as referring to a texture embedded in the source file
 	 * rather than to a path on disk. Followed by the embedded texture's index.
@@ -88,6 +102,25 @@ public:
 private:
 	/** Parses the source file if it has not been parsed already. Returns null on failure. */
 	TSharedPtr<FAssimpScene> EnsureSceneLoaded() const;
+
+	/**
+	 * Emits one animation track set per clip per skeleton it drives.
+	 *
+	 * Split out of Translate() because it is the one part that needs the finished scene graph: a
+	 * track addresses bones by their scene node UID, so it can only be written once those UIDs are
+	 * settled.
+	 *
+	 * @param BaseNodeContainer  Container to add track nodes to.
+	 * @param Scene              Parsed scene.
+	 * @param NodeIndexByName    First node index for each node name, for resolving bones.
+	 * @param SceneNodeUids      Scene node UID per node index.
+	 * @return                   Number of track sets emitted.
+	 */
+	int32 BuildAnimationTracks(
+		UInterchangeBaseNodeContainer& BaseNodeContainer,
+		const FAssimpScene& Scene,
+		const TMap<FString, int32>& NodeIndexByName,
+		const TArray<FString>& SceneNodeUids) const;
 
 	/**
 	 * Parsed scene, cached between Translate() and the payload requests that follow it.

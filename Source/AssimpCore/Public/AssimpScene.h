@@ -216,6 +216,46 @@ public:
 		FMeshDescription& OutMeshDescription,
 		TArray<FString>& OutJointNames) const;
 
+	/**
+	 * Frame rate one animation clip should be baked at.
+	 *
+	 * Not simply the file's ticks-per-second: that is a timebase (glTF counts in milliseconds,
+	 * Collada in seconds) and only some formats state something that is genuinely a frame rate.
+	 * Reading the timebase as a frame rate would bake a glTF clip at 1000 fps and a Collada clip at
+	 * 1 fps, so it is used only when it is plausibly one, and 30 is used otherwise.
+	 *
+	 * @param AnimationIndex  Index into GetSceneInfo().Animations.
+	 * @return                Frames per second, or 0 for an invalid index.
+	 */
+	double GetAnimationSampleRate(int32 AnimationIndex) const;
+
+	/**
+	 * Samples one node's animated local transform at a fixed rate.
+	 *
+	 * Baked rather than curve-shaped on purpose: Assimp's channels are three independent key arrays
+	 * with no interpolation mode, whereas Unreal stores one transform per bone per frame. Evaluating
+	 * all three at common frame times is the honest translation, and it is what Interchange requests
+	 * of a translator.
+	 *
+	 * The transforms are node-local and in Unreal space, converted by the same path as the reference
+	 * pose, so a pose and the animation driving it cannot end up in different spaces.
+	 *
+	 * @param AnimationIndex     Index into GetSceneInfo().Animations.
+	 * @param NodeName           Node to sample; typically a bone name from FAssimpSkinnedMeshGroup.
+	 * @param SampleRateHz       Frames per second to bake at. See GetAnimationSampleRate.
+	 * @param RangeStartSeconds  Start of the sampled range.
+	 * @param RangeEndSeconds    End of the sampled range, inclusive.
+	 * @param OutKeys            Receives RoundToInt(Range * Rate) + 1 transforms.
+	 * @return                   False when the clip does not animate that node.
+	 */
+	bool GetBakedAnimationTrack(
+		int32 AnimationIndex,
+		const FString& NodeName,
+		double SampleRateHz,
+		double RangeStartSeconds,
+		double RangeEndSeconds,
+		TArray<FTransform>& OutKeys) const;
+
 	/** Fetches an embedded texture by index into [0, FAssimpSceneInfo::NumEmbeddedTextures). */
 	bool GetEmbeddedTexture(int32 TextureIndex, FAssimpEmbeddedTexture& OutTexture) const;
 
