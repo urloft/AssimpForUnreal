@@ -61,6 +61,13 @@ public:
 	 *                       what Interchange's FMeshPayloadData::JointNames wants, and it is the only
 	 *                       thing that lets a caller merging several meshes remap their weights
 	 *                       consistently. Empty when the result is not skinned.
+	 * @param MorphTargetIndex  When set, each mesh's positions and normals are taken from that one of
+	 *                       its anim-meshes instead of from the mesh itself, producing the morphed
+	 *                       shape. Everything else -- topology, winding, UVs, skin weights -- is
+	 *                       produced by the identical code, which is the point: a morph target is
+	 *                       only meaningful if its vertices correspond one-for-one with the base
+	 *                       mesh's, and running a second, separate conversion is exactly how that
+	 *                       correspondence gets quietly broken.
 	 */
 	static bool Convert(
 		const aiScene& Scene,
@@ -69,7 +76,8 @@ public:
 		const FAssimpImportSettings& Settings,
 		FMeshDescription& OutMeshDescription,
 		TArray<FString>& OutJointNames,
-		FString& OutError);
+		FString& OutError,
+		int32 MorphTargetIndex = INDEX_NONE);
 
 	/**
 	 * Computes the axis-aligned bounds of a single mesh in Unreal space.

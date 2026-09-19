@@ -93,6 +93,40 @@ public:
 	/** Converts a node or bone transform, conjugating it into Unreal's basis. */
 	FTransform ConvertTransform(const aiMatrix4x4& In) const;
 
+	// ---------------------------------------------------------------------------------------------
+	// The inverse, for export
+	// ---------------------------------------------------------------------------------------------
+	//
+	// Export is not a separate coordinate problem; it is this one run backwards, and it lives here
+	// so that it cannot drift from the forward direction. Every inverse below is the algebraic
+	// inverse of the function directly above it, and the round-trip test asserts exactly that:
+	// importing a file, exporting it, and importing the result must give back the same geometry.
+
+	/** Inverse of ConvertPosition: removes the scale, then the basis change. */
+	FORCEINLINE aiVector3D InvertPosition(const FVector3f& In) const
+	{
+		const float InverseScale = (AppliedScale != 0.0f) ? 1.0f / AppliedScale : 1.0f;
+		return InvertVector(In * InverseScale);
+	}
+
+	/** Inverse of ConvertDirection: the basis change alone. */
+	FORCEINLINE aiVector3D InvertDirection(const FVector3f& In) const
+	{
+		return InvertVector(In);
+	}
+
+	/** Inverse of ConvertUV. The V flip is its own inverse, which is why this reads the same. */
+	FORCEINLINE aiVector3D InvertUV(const FVector2f& In) const
+	{
+		return bFlipV
+			? aiVector3D(In.X, 1.0f - In.Y, 0.0f)
+			: aiVector3D(In.X, In.Y, 0.0f);
+	}
+
+	/** Inverse of ConvertTransform. */
+	aiMatrix4x4 InvertTransform(const FTransform& In) const;
+
+
 	/** Converts a colour, clamping to a sane range. Assimp colours are already linear RGBA. */
 	static FORCEINLINE FLinearColor ConvertColor(const aiColor4D& In)
 	{
@@ -122,6 +156,22 @@ private:
 
 		// Unreal.X = -Source.Z, Unreal.Y = Source.X, Unreal.Z = Source.Y
 		return FVector3f(-In.z, In.x, In.y);
+	}
+
+	/**
+	 * Inverse of TransformVector.
+	 *
+	 * Unreal.X = -Source.Z, Unreal.Y = Source.X, Unreal.Z = Source.Y inverts to
+	 * Source.X = Unreal.Y, Source.Y = Unreal.Z, Source.Z = -Unreal.X.
+	 */
+	FORCEINLINE aiVector3D InvertVector(const FVector3f& In) const
+	{
+		if (bIdentityBasis)
+		{
+			return aiVector3D(In.X, In.Y, In.Z);
+		}
+
+		return aiVector3D(In.Y, In.Z, -In.X);
 	}
 
 	/** Basis matrix as an FMatrix, for conjugating transforms. */

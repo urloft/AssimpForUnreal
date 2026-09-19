@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "AssimpExporter.h"
 #include "AssimpImportSettings.h"
 #include "CoreMinimal.h"
 #include "Kismet/BlueprintFunctionLibrary.h"
@@ -10,6 +11,7 @@
 
 class UAssimpSceneObject;
 class UDynamicMeshComponent;
+class USceneComponent;
 class UMaterialInterface;
 class AActor;
 
@@ -118,6 +120,68 @@ public:
 		UAssimpSceneObject* SceneObject,
 		bool bMergeByNode = true,
 		UMaterialInterface* BaseMaterial = nullptr);
+
+	/**
+	 * Spawns a camera or light component for each one the file defines, placed by the node it hangs
+	 * off.
+	 *
+	 * Separate from the mesh spawner rather than folded into it, because wanting a file's geometry
+	 * is common and wanting its lighting rig is not: a file's lights are authored for the DCC tool's
+	 * renderer, and dropping them into a lit Unreal scene alongside its existing lighting is a
+	 * decision, not a default.
+	 *
+	 * Intensity is deliberately not taken from the file. Assimp reports a colour whose magnitude
+	 * carries the intensity in whatever units the exporter used -- lumens, candela, or an arbitrary
+	 * multiplier -- and there is no unit to convert from. The colour is applied and the intensity is
+	 * left at Unreal's default, which is a visible, sane light that can then be tuned, rather than
+	 * one that is invisible or blinding depending on which tool wrote the file.
+	 *
+	 * Note that FAssimpImportSettings::bImportCameras and bImportLights both default to false, so a
+	 * scene imported with the defaults describes neither and this returns nothing. That is the
+	 * setting to turn on, not a fault here.
+	 *
+	 * @param Actor        Actor to attach the components to.
+	 * @param SceneObject  Scene to read the cameras and lights from.
+	 * @return             The components created, cameras first, in the file's order.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Assimp|Spawn")
+	static TArray<USceneComponent*> SpawnSceneCamerasAndLights(
+		AActor* Actor,
+		UAssimpSceneObject* SceneObject);
+
+	/**
+	 * Writes a loaded scene's geometry to a file.
+	 *
+	 * The export is the import run backwards, through the same coordinate conversion inverted, so a
+	 * file read and written again comes back as the same geometry rather than mirrored or inside
+	 * out.
+	 *
+	 * Geometry only, in a single flat node: material names, skinning and animation are not written.
+	 * The scope is deliberate -- see FAssimpExporter -- and the alternative would be an export path
+	 * far larger than the half of it that is verified.
+	 *
+	 * @param SceneObject  Scene to write.
+	 * @param FilePath     Destination. Its directory is created if needed.
+	 * @param FormatId     Assimp format id such as "objnomtl". Leave empty to infer it from the
+	 *                     file extension.
+	 * @param OutResult    Receives success, the error, and how much was written.
+	 * @return             True on success.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Assimp|Export", meta = (AutoCreateRefTerm = "FormatId"))
+	static bool ExportSceneToFile(
+		UAssimpSceneObject* SceneObject,
+		const FString& FilePath,
+		const FString& FormatId,
+		FAssimpExportResult& OutResult);
+
+	/**
+	 * Formats the loaded Assimp library can write.
+	 *
+	 * Reported by the library rather than from a list, because what a build can write depends on how
+	 * it was compiled: one built with exporters disabled reports none.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Assimp|Export")
+	static TArray<FAssimpExportFormat> GetSupportedExportFormats();
 
 	/**
 	 * Extensions Assimp can read, without the leading dot.

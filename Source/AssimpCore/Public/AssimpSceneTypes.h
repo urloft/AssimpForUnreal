@@ -181,9 +181,47 @@ struct ASSIMPCORE_API FAssimpMeshInfo
 	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Mesh")
 	TArray<FString> BoneNames;
 
+	/** Indices into FAssimpSceneInfo::MorphTargets of the morph targets deforming this mesh. */
+	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Mesh")
+	TArray<int32> MorphTargetIndices;
+
 	/** Axis-aligned bounds in Unreal space, after coordinate and scale conversion. */
 	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Mesh")
 	FBox BoundingBox = FBox(ForceInit);
+};
+
+/**
+ * One morph target (blend shape) belonging to a mesh.
+ *
+ * Assimp calls these anim-meshes, and stores them as whole replacement attribute arrays rather than
+ * as deltas: a morph target is the mesh in its deformed shape, not the difference. Unreal wants the
+ * difference, and works it out by comparing the two -- which only holds together if both come out of
+ * the same conversion with the same vertex order.
+ */
+USTRUCT(BlueprintType)
+struct ASSIMPCORE_API FAssimpMorphTargetInfo
+{
+	GENERATED_BODY()
+
+	/** Name from the file, or a synthesised one when it declared none. Becomes the UMorphTarget's name. */
+	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Morph")
+	FString Name;
+
+	/** Index into FAssimpSceneInfo::Meshes of the mesh this deforms. */
+	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Morph")
+	int32 MeshIndex = INDEX_NONE;
+
+	/** Index of this morph target within that mesh, which is how a weight channel addresses it. */
+	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Morph")
+	int32 MorphIndex = INDEX_NONE;
+
+	/** Default influence the file gives it, in the range [0, 1]. */
+	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Morph")
+	float Weight = 0.0f;
+
+	/** True when the target supplies its own normals rather than leaving the base mesh's in place. */
+	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Morph")
+	bool bHasNormals = false;
 };
 
 /** A node in the scene hierarchy. Nodes are stored flattened, parents always before children. */
@@ -231,6 +269,18 @@ struct ASSIMPCORE_API FAssimpSkeletonBone
 	/** Bone name, matching both the node and the bone reference it was reconstructed from. */
 	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Skeleton")
 	FString Name;
+
+	/**
+	 * Index of this bone's node in FAssimpSceneInfo::Nodes, or INDEX_NONE.
+	 *
+	 * Carried so consumers never have to find the node by name. Names are not unique, and Unreal's
+	 * FString comparison is case-insensitive besides -- which is a real trap here, because Assimp
+	 * inserts a synthetic root node called "ROOT" above a glTF scene whose own root bone is commonly
+	 * called "Root". Matching on the name marks that synthetic node as a bone, and the skeleton then
+	 * appears to be rooted one level above where it is.
+	 */
+	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Skeleton")
+	int32 NodeIndex = INDEX_NONE;
 
 	/** Index of the parent in the containing array, or INDEX_NONE for the root. Always smaller than this bone's index. */
 	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Skeleton")
@@ -323,6 +373,28 @@ struct ASSIMPCORE_API FAssimpCameraInfo
 	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Camera")
 	FString Name;
 
+	/** Index of that node in FAssimpSceneInfo::Nodes, or INDEX_NONE when no node carries the name. */
+	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Camera")
+	int32 NodeIndex = INDEX_NONE;
+
+	/**
+	 * Placement within its node, in Unreal space, oriented so the camera looks down +X.
+	 *
+	 * Assimp keeps a camera's position and orientation separate from the node transform: the node
+	 * says where the rig is, this says where the lens sits on it. Composing the two is the caller's
+	 * job, because only the caller knows the node's world transform.
+	 */
+	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Camera")
+	FTransform LocalTransform = FTransform::Identity;
+
+	/**
+	 * Full horizontal field of view, in degrees -- the same quantity and units as a
+	 * UCameraComponent's FieldOfView.
+	 *
+	 * Normalised here because Assimp is not consistent about it: its own header documents a
+	 * half-angle and FBX stores one, while Collada and glTF store the full angle. The source format
+	 * is what settles it, and doing that once here keeps every consumer from having to know.
+	 */
 	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Camera")
 	float HorizontalFieldOfViewDegrees = 90.0f;
 
@@ -358,15 +430,35 @@ struct ASSIMPCORE_API FAssimpLightInfo
 	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Light")
 	FString Name;
 
+	/** Index of that node in FAssimpSceneInfo::Nodes, or INDEX_NONE when no node carries the name. */
+	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Light")
+	int32 NodeIndex = INDEX_NONE;
+
+	/**
+	 * Placement within its node, in Unreal space, oriented so the light shines down +X.
+	 *
+	 * +X because that is the axis Unreal's directional and spot lights emit along. A point light
+	 * ignores the rotation entirely, which is why one transform serves all three types.
+	 */
+	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Light")
+	FTransform LocalTransform = FTransform::Identity;
+
 	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Light")
 	EAssimpLightType Type = EAssimpLightType::Point;
 
 	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Light")
 	FLinearColor DiffuseColor = FLinearColor::White;
 
+	/**
+	 * Full cone angle, not the half-angle Unreal's spot light takes.
+	 *
+	 * Reported as the file states it -- Assimp's own header notes this is 2*PI for a point light,
+	 * which only makes sense as a full angle. Consumers driving a USpotLightComponent must halve it.
+	 */
 	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Light")
 	float InnerConeAngleDegrees = 0.0f;
 
+	/** Full cone angle, as above. */
 	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Light")
 	float OuterConeAngleDegrees = 0.0f;
 
@@ -414,6 +506,15 @@ struct ASSIMPCORE_API FAssimpSceneInfo
 	/** Number of embedded textures available via FAssimpScene::GetEmbeddedTexture. */
 	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Scene")
 	int32 NumEmbeddedTextures = 0;
+
+	/**
+	 * Every morph target in the file, flattened across meshes. Empty when morph import is disabled.
+	 *
+	 * Flat rather than nested under each mesh because a weight animation channel names a mesh and a
+	 * morph index, and both consumers want to look one up without walking the mesh list.
+	 */
+	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Scene")
+	TArray<FAssimpMorphTargetInfo> MorphTargets;
 
 	/** Every animation clip in the file. Empty when animation import is disabled. */
 	UPROPERTY(BlueprintReadOnly, Category = "Assimp|Scene")

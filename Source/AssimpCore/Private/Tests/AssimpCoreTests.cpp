@@ -1,8 +1,12 @@
 // Copyright (c) 2026 Pratik Kumar. Licensed under the MIT License.
 
 #include "AssimpCore.h"
+#include "AssimpExporter.h"
 #include "AssimpImportSettings.h"
 #include "AssimpScene.h"
+
+#include "HAL/FileManager.h"
+#include "Misc/ScopeExit.h"
 
 #include "Interfaces/IPluginManager.h"
 #include "MeshDescription.h"
@@ -1072,7 +1076,11 @@ bool FAssimpAnimationTest::RunTest(const FString& /*Parameters*/)
 
 	TestEqual(TEXT("Exactly one node is animated"), Animation.AnimatedNodeNames.Num(), 1);
 	TestTrue(TEXT("Bone1 is the animated node"), Animation.AnimatedNodeNames.Contains(TEXT("Bone1")));
-	TestFalse(TEXT("No mesh or morph channels in this clip"), Animation.bHasMeshOrMorphChannels);
+
+	// The fixture also animates its morph target's weight, which is a morph channel rather than a
+	// node channel -- so the clip reports one even though only one node moves. Morph weights are
+	// covered by Core.MorphTargets; what matters here is that the two kinds are counted separately.
+	TestTrue(TEXT("The clip reports its morph channel"), Animation.bHasMeshOrMorphChannels);
 
 	// --- The skeleton the clip can drive --------------------------------------------------------
 	if (!TestEqual(TEXT("One skinned mesh group"), Info.SkinnedMeshGroups.Num(), 1))
@@ -1251,6 +1259,480 @@ bool FAssimpAnimationTest::RunTest(const FString& /*Parameters*/)
 			TestTrue(TEXT("Skinning is unaffected by disabling animation"),
 				QuietScene->GetSceneInfo().SkinnedMeshGroups.Num() == 1);
 		}
+	}
+
+	return true;
+}
+
+// =================================================================================================
+// Morph targets
+// =================================================================================================
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FAssimpMorphTargetTest,
+	"AssimpForUnreal.Core.MorphTargets",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+/**
+ * Asserts that a morph target is described, converted, and its weight curve read back.
+ *
+ * Two things make a morph target go wrong in ways that still import cleanly. The first is the vertex
+ * correspondence: Unreal derives the deltas by comparing the morphed mesh against the base one, per
+ * vertex index, so if the two conversions disagree about vertex order the result is a morph target
+ * that tears the mesh apart rather than deforming it. That is why the fixture displaces every vertex
+ * by the same vector -- a correct conversion moves all four identically, and any reordering shows up
+ * immediately as vertices that moved differently.
+ *
+ * The second is the direction: a morph target that moves along the wrong axis is still a valid morph
+ * target, so only a known expected vector catches it.
+ */
+bool FAssimpMorphTargetTest::RunTest(const FString& /*Parameters*/)
+{
+	const FString FilePath = AssimpTestUtils::GetTestDataPath(TEXT("SkinnedQuad.gltf"));
+	if (!TestTrue(TEXT("Test fixture path resolved"), !FilePath.IsEmpty()))
+	{
+		return false;
+	}
+
+	FAssimpImportSettings Settings = AssimpTestUtils::MakeExactSettings();
+	Settings.bImportSkeletalMesh = true;
+	Settings.bImportMorphTargets = true;
+	Settings.bApplyFileUnitScale = false;
+
+	FAssimpLoadResult LoadResult;
+	const TSharedPtr<FAssimpScene> Scene = FAssimpScene::LoadFromFile(FilePath, Settings, LoadResult);
+
+	if (!TestTrue(FString::Printf(TEXT("SkinnedQuad.gltf loaded (%s)"), *LoadResult.ErrorMessage),
+		Scene.IsValid()))
+	{
+		return false;
+	}
+
+	const FAssimpSceneInfo& Info = Scene->GetSceneInfo();
+
+	// --- Described ------------------------------------------------------------------------------
+	if (!TestEqual(TEXT("One morph target"), Info.MorphTargets.Num(), 1))
+	{
+		return false;
+	}
+
+	const FAssimpMorphTargetInfo& MorphTarget = Info.MorphTargets[0];
+
+	AddInfo(FString::Printf(TEXT("Morph target '%s' on mesh %d (index %d), rest weight %.3f"),
+		*MorphTarget.Name, MorphTarget.MeshIndex, MorphTarget.MorphIndex, MorphTarget.Weight));
+
+	// glTF carries a morph target's name only in an extras field. Losing it would leave Unreal with
+	// nothing to key the morph target by, so the name surviving is a real assertion.
+	TestEqual(TEXT("Morph target keeps its name"), MorphTarget.Name, FString(TEXT("Bulge")));
+	TestEqual(TEXT("Morph target belongs to mesh 0"), MorphTarget.MeshIndex, 0);
+	TestEqual(TEXT("Morph target is the mesh's first"), MorphTarget.MorphIndex, 0);
+
+	if (TestTrue(TEXT("The mesh lists its morph target"), Info.Meshes.Num() > 0))
+	{
+		TestEqual(TEXT("Mesh lists exactly one morph target"),
+			Info.Meshes[0].MorphTargetIndices.Num(), 1);
+		TestTrue(TEXT("Mesh points at morph target 0"),
+			Info.Meshes[0].MorphTargetIndices.Contains(0));
+	}
+
+	// --- Converted ------------------------------------------------------------------------------
+	FMeshDescription BaseMesh;
+	if (!TestTrue(TEXT("Base mesh converted"), Scene->GetMeshDescription(0, BaseMesh)))
+	{
+		return false;
+	}
+
+	FMeshDescription MorphedMesh;
+	if (!TestTrue(TEXT("Morph target converted"),
+		Scene->GetMorphTargetMeshDescription(0, MorphedMesh)))
+	{
+		return false;
+	}
+
+	// Identical topology is not a nicety. Unreal pairs the two by vertex index, so a different count
+	// means the deltas are computed against the wrong vertices -- or not at all.
+	TestEqual(TEXT("Morph target has the same vertex count as the base mesh"),
+		MorphedMesh.Vertices().Num(), BaseMesh.Vertices().Num());
+	TestEqual(TEXT("Morph target has the same triangle count as the base mesh"),
+		MorphedMesh.Triangles().Num(), BaseMesh.Triangles().Num());
+
+	FStaticMeshAttributes BaseAttributes(BaseMesh);
+	FStaticMeshAttributes MorphedAttributes(MorphedMesh);
+
+	TVertexAttributesConstRef<FVector3f> BasePositions = BaseAttributes.GetVertexPositions();
+	TVertexAttributesConstRef<FVector3f> MorphedPositions = MorphedAttributes.GetVertexPositions();
+
+	// Source displacement (0, 0, 1) becomes (-1, 0, 0) under Unreal.X = -Source.Z.
+	const FVector3f ExpectedDelta(-1.0f, 0.0f, 0.0f);
+
+	int32 VerticesChecked = 0;
+	int32 WrongDeltas = 0;
+
+	TArray<FVertexID> BaseVertexIDs;
+	for (const FVertexID VertexID : BaseMesh.Vertices().GetElementIDs())
+	{
+		BaseVertexIDs.Add(VertexID);
+	}
+
+	TArray<FVertexID> MorphedVertexIDs;
+	for (const FVertexID VertexID : MorphedMesh.Vertices().GetElementIDs())
+	{
+		MorphedVertexIDs.Add(VertexID);
+	}
+
+	for (int32 Index = 0; Index < FMath::Min(BaseVertexIDs.Num(), MorphedVertexIDs.Num()); ++Index)
+	{
+		const FVector3f Delta =
+			MorphedPositions[MorphedVertexIDs[Index]] - BasePositions[BaseVertexIDs[Index]];
+
+		if (!Delta.Equals(ExpectedDelta, UE_KINDA_SMALL_NUMBER))
+		{
+			++WrongDeltas;
+			AddInfo(FString::Printf(TEXT("vertex %d moved %s, expected %s"),
+				Index, *Delta.ToString(), *ExpectedDelta.ToString()));
+		}
+
+		++VerticesChecked;
+	}
+
+	TestEqual(TEXT("All four vertices were compared"), VerticesChecked, 4);
+	TestEqual(TEXT("Every vertex moved by the converted displacement"), WrongDeltas, 0);
+
+	// --- Weight curve ---------------------------------------------------------------------------
+	TArray<float> Times;
+	TArray<float> Weights;
+	if (TestTrue(TEXT("Morph weight curve read"),
+		Scene->GetMorphTargetWeightCurve(0, 0, Times, Weights)))
+	{
+		AddInfo(FString::Printf(TEXT("Weight curve: %d key(s), %.3f at %.3fs to %.3f at %.3fs"),
+			Times.Num(),
+			Weights.Num() > 0 ? Weights[0] : -1.0f, Times.Num() > 0 ? Times[0] : -1.0f,
+			Weights.Num() > 0 ? Weights.Last() : -1.0f, Times.Num() > 0 ? Times.Last() : -1.0f));
+
+		TestEqual(TEXT("Key times and weights come in pairs"), Times.Num(), Weights.Num());
+
+		if (TestTrue(TEXT("The curve has at least two keys"), Times.Num() >= 2))
+		{
+			// The fixture runs the weight from 0 to 1 across one second. Times arrive in seconds,
+			// which means the clip's timebase was applied -- glTF states it in milliseconds, so a
+			// conversion that skipped it would put the last key at 1000.
+			TestTrue(FString::Printf(TEXT("Curve starts at t=0 (got %.4f)"), Times[0]),
+				FMath::IsNearlyEqual(Times[0], 0.0f, 0.01f));
+			TestTrue(FString::Printf(TEXT("Curve ends at t=1s (got %.4f)"), Times.Last()),
+				FMath::IsNearlyEqual(Times.Last(), 1.0f, 0.01f));
+
+			TestTrue(FString::Printf(TEXT("Weight starts at 0 (got %.4f)"), Weights[0]),
+				FMath::IsNearlyEqual(Weights[0], 0.0f, 0.01f));
+			TestTrue(FString::Printf(TEXT("Weight ends at 1 (got %.4f)"), Weights.Last()),
+				FMath::IsNearlyEqual(Weights.Last(), 1.0f, 0.01f));
+		}
+	}
+
+	// --- Disabling morph import -------------------------------------------------------------------
+	{
+		FAssimpImportSettings NoMorphs = Settings;
+		NoMorphs.bImportMorphTargets = false;
+
+		FAssimpLoadResult QuietResult;
+		const TSharedPtr<FAssimpScene> QuietScene =
+			FAssimpScene::LoadFromFile(FilePath, NoMorphs, QuietResult);
+
+		if (TestTrue(TEXT("Scene loads with morph import disabled"), QuietScene.IsValid()))
+		{
+			TestEqual(TEXT("No morph targets are described when morph import is off"),
+				QuietScene->GetSceneInfo().MorphTargets.Num(), 0);
+
+			// Turning morph targets off must not take the geometry with it.
+			TestTrue(TEXT("The mesh still imports"),
+				QuietScene->GetSceneInfo().Meshes.Num() == 1);
+		}
+	}
+
+	return true;
+}
+
+// =================================================================================================
+// Export
+// =================================================================================================
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FAssimpExportRoundTripTest,
+	"AssimpForUnreal.Core.ExportRoundTrip",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+/**
+ * Asserts that exporting undoes importing, by doing both and comparing.
+ *
+ * A round trip is the only test that can catch the defect that matters here. Every individual piece
+ * of the export -- the basis change, the winding reversal, the V flip -- produces a perfectly valid
+ * file when inverted wrongly; the model simply comes back mirrored, or inside out, or with its UVs
+ * upside down. Comparing the re-imported geometry against the original is what makes each of those
+ * a failure rather than a plausible-looking file.
+ *
+ * The comparison is on the converted, Unreal-space geometry at both ends. That is the point: if the
+ * export inverted the basis change incorrectly, the second import would apply the forward conversion
+ * to already-wrong coordinates and the two would disagree.
+ */
+bool FAssimpExportRoundTripTest::RunTest(const FString& /*Parameters*/)
+{
+	// The refusal case below deliberately provokes an error, which the automation framework counts
+	// as a failure unless it is declared expected.
+	AddExpectedErrorPlain(TEXT("is not a format this Assimp build can write"),
+		EAutomationExpectedErrorFlags::Contains, 0);
+
+	// Export is only possible if the vendored library was built with exporters. Say so plainly
+	// rather than failing with something opaque, because the fix is a rebuild, not a code change.
+	const TArray<FAssimpExportFormat> Formats = FAssimpExporter::GetSupportedFormats();
+
+	AddInfo(FString::Printf(TEXT("Assimp reports %d export format(s)."), Formats.Num()));
+
+	if (!TestTrue(
+		TEXT("This Assimp build can export. If not, it was compiled with ASSIMP_NO_EXPORT; ")
+		TEXT("rebuild it with Scripts/BuildAssimp.ps1."),
+		Formats.Num() > 0))
+	{
+		return false;
+	}
+
+	// Named explicitly rather than inferred: several ids share the .obj extension, and the one
+	// without a material sidecar keeps the test to a single file.
+	const FString FormatId = TEXT("objnomtl");
+	if (!TestTrue(FString::Printf(TEXT("The '%s' exporter is available"), *FormatId),
+		FAssimpExporter::IsFormatSupported(FormatId)))
+	{
+		TArray<FString> FormatIds;
+		for (const FAssimpExportFormat& Format : Formats)
+		{
+			FormatIds.Add(Format.FormatId);
+		}
+		AddInfo(FString::Printf(TEXT("Available: %s"), *FString::Join(FormatIds, TEXT(", "))));
+		return false;
+	}
+
+	// --- Import ----------------------------------------------------------------------------------
+	const FString SourcePath = AssimpTestUtils::GetTestDataPath(TEXT("Cube.ply"));
+	if (!TestTrue(TEXT("Test fixture path resolved"), !SourcePath.IsEmpty()))
+	{
+		return false;
+	}
+
+	const FAssimpImportSettings Settings = AssimpTestUtils::MakeExactSettings();
+
+	FAssimpLoadResult LoadResult;
+	const TSharedPtr<FAssimpScene> Original =
+		FAssimpScene::LoadFromFile(SourcePath, Settings, LoadResult);
+
+	if (!TestTrue(FString::Printf(TEXT("Cube.ply loaded (%s)"), *LoadResult.ErrorMessage),
+		Original.IsValid()))
+	{
+		return false;
+	}
+
+	FMeshDescription OriginalMesh;
+	if (!TestTrue(TEXT("Original mesh converted"), Original->GetMeshDescription(0, OriginalMesh)))
+	{
+		return false;
+	}
+
+	// --- Export ----------------------------------------------------------------------------------
+	const FString DestinationPath = FPaths::Combine(
+		FPaths::ProjectSavedDir(), TEXT("AssimpExportTests"), TEXT("CubeRoundTrip.obj"));
+
+	// Leave nothing behind whichever way the test exits.
+	ON_SCOPE_EXIT
+	{
+		IFileManager::Get().Delete(*DestinationPath, /*RequireExists*/ false, /*EvenReadOnly*/ true);
+	};
+
+	FAssimpExporter::FExportMesh ExportMesh;
+	ExportMesh.Name = TEXT("Cube");
+	ExportMesh.MeshDescription = &OriginalMesh;
+
+	FAssimpExportResult ExportResult;
+	const bool bExported = FAssimpExporter::ExportMeshes(
+		MakeArrayView(&ExportMesh, 1), DestinationPath, FormatId, ExportResult);
+
+	if (!TestTrue(FString::Printf(TEXT("Export succeeded (%s)"), *ExportResult.ErrorMessage), bExported))
+	{
+		return false;
+	}
+
+	TestEqual(TEXT("One mesh was written"), ExportResult.MeshesWritten, 1);
+
+	if (!TestTrue(TEXT("The exported file exists"),
+		IFileManager::Get().FileExists(*DestinationPath)))
+	{
+		return false;
+	}
+
+	AddInfo(FString::Printf(TEXT("Wrote %lld bytes to '%s' in %.3fs."),
+		IFileManager::Get().FileSize(*DestinationPath), *DestinationPath, ExportResult.ElapsedSeconds));
+
+	// --- Import it back ----------------------------------------------------------------------------
+	FAssimpLoadResult ReloadResult;
+	const TSharedPtr<FAssimpScene> RoundTripped =
+		FAssimpScene::LoadFromFile(DestinationPath, Settings, ReloadResult);
+
+	if (!TestTrue(FString::Printf(TEXT("The exported file reimports (%s)"), *ReloadResult.ErrorMessage),
+		RoundTripped.IsValid()))
+	{
+		return false;
+	}
+
+	FMeshDescription ReloadedMesh;
+	if (!TestTrue(TEXT("Round-tripped mesh converted"),
+		RoundTripped->GetMeshDescription(0, ReloadedMesh)))
+	{
+		return false;
+	}
+
+	// --- Compare -----------------------------------------------------------------------------------
+	TestEqual(TEXT("Triangle count survived the round trip"),
+		ReloadedMesh.Triangles().Num(), OriginalMesh.Triangles().Num());
+
+	FStaticMeshConstAttributes OriginalAttributes(OriginalMesh);
+	FStaticMeshConstAttributes ReloadedAttributes(ReloadedMesh);
+
+	TVertexAttributesConstRef<FVector3f> OriginalPositions = OriginalAttributes.GetVertexPositions();
+	TVertexAttributesConstRef<FVector3f> ReloadedPositions = ReloadedAttributes.GetVertexPositions();
+
+	/** Axis-aligned bounds of a mesh description, which are order-independent. */
+	auto ComputeBounds = [](const FMeshDescription& Mesh, TVertexAttributesConstRef<FVector3f> Positions)
+	{
+		FBox Bounds(ForceInit);
+		for (const FVertexID VertexID : Mesh.Vertices().GetElementIDs())
+		{
+			Bounds += FVector(Positions[VertexID]);
+		}
+		return Bounds;
+	};
+
+	const FBox OriginalBounds = ComputeBounds(OriginalMesh, OriginalPositions);
+	const FBox ReloadedBounds = ComputeBounds(ReloadedMesh, ReloadedPositions);
+
+	AddInfo(FString::Printf(TEXT("Original bounds %s .. %s"),
+		*OriginalBounds.Min.ToString(), *OriginalBounds.Max.ToString()));
+	AddInfo(FString::Printf(TEXT("Reloaded bounds %s .. %s"),
+		*ReloadedBounds.Min.ToString(), *ReloadedBounds.Max.ToString()));
+
+	// Bounds rather than per-vertex equality, because the exporter writes unwelded triangles and the
+	// importer welds on the way back, so vertex ORDER is not preserved and need not be. What must be
+	// preserved is where the geometry is -- and a mirrored export moves the bounds, because the
+	// fixture's cube is not centred on every axis.
+	TestTrue(FString::Printf(TEXT("Bounds minimum survived (expected %s, got %s)"),
+			*OriginalBounds.Min.ToString(), *ReloadedBounds.Min.ToString()),
+		ReloadedBounds.Min.Equals(OriginalBounds.Min, 0.01));
+
+	TestTrue(FString::Printf(TEXT("Bounds maximum survived (expected %s, got %s)"),
+			*OriginalBounds.Max.ToString(), *ReloadedBounds.Max.ToString()),
+		ReloadedBounds.Max.Equals(OriginalBounds.Max, 0.01));
+
+	// Winding is the half a bounds comparison cannot see: a cube exported with reversed faces
+	// occupies exactly the same space. Every face of a closed convex mesh must have its geometric
+	// normal pointing away from the centre, which is the same check the import test makes.
+	const FVector Centre = ReloadedBounds.GetCenter();
+	int32 InwardFacing = 0;
+	int32 FacesChecked = 0;
+
+	for (const FTriangleID TriangleID : ReloadedMesh.Triangles().GetElementIDs())
+	{
+		TArrayView<const FVertexID> Corners = ReloadedMesh.GetTriangleVertices(TriangleID);
+		if (Corners.Num() != 3)
+		{
+			continue;
+		}
+
+		const FVector A(ReloadedPositions[Corners[0]]);
+		const FVector B(ReloadedPositions[Corners[1]]);
+		const FVector C(ReloadedPositions[Corners[2]]);
+
+		const FVector GeometricNormal = FVector::CrossProduct(B - A, C - A);
+		const FVector Outward = ((A + B + C) / 3.0) - Centre;
+
+		if ((GeometricNormal | Outward) <= 0.0)
+		{
+			++InwardFacing;
+		}
+
+		++FacesChecked;
+	}
+
+	AddInfo(FString::Printf(TEXT("Checked %d face(s); %d faced inward."), FacesChecked, InwardFacing));
+
+	TestTrue(TEXT("Every face was checked"), FacesChecked > 0);
+	TestEqual(TEXT("No face came back inside out"), InwardFacing, 0);
+
+	// --- A shape that is not symmetric --------------------------------------------------------------
+	// The cube above is symmetric about every axis, which means it cannot see the one mistake most
+	// worth catching: applying the basis change again on export instead of inverting it. Doing that
+	// maps (x,y,z) to (-y,-z,x), which leaves a symmetric cube's bounds exactly where they were.
+	// AxisProbe's three vertices sit on the source axes, so any basis error moves its bounds.
+	{
+		const FString ProbePath = AssimpTestUtils::GetTestDataPath(TEXT("AxisProbe.ply"));
+		const FString ProbeDestination = FPaths::Combine(
+			FPaths::ProjectSavedDir(), TEXT("AssimpExportTests"), TEXT("AxisProbeRoundTrip.obj"));
+
+		ON_SCOPE_EXIT
+		{
+			IFileManager::Get().Delete(*ProbeDestination, /*RequireExists*/ false, /*EvenReadOnly*/ true);
+		};
+
+		FAssimpLoadResult ProbeLoadResult;
+		const TSharedPtr<FAssimpScene> Probe =
+			FAssimpScene::LoadFromFile(ProbePath, Settings, ProbeLoadResult);
+
+		FMeshDescription ProbeMesh;
+		if (Probe.IsValid() && Probe->GetMeshDescription(0, ProbeMesh))
+		{
+			FAssimpExporter::FExportMesh ProbeExport;
+			ProbeExport.Name = TEXT("AxisProbe");
+			ProbeExport.MeshDescription = &ProbeMesh;
+
+			FAssimpExportResult ProbeExportResult;
+			if (TestTrue(FString::Printf(TEXT("AxisProbe exported (%s)"), *ProbeExportResult.ErrorMessage),
+				FAssimpExporter::ExportMeshes(
+					MakeArrayView(&ProbeExport, 1), ProbeDestination, FormatId, ProbeExportResult)))
+			{
+				FAssimpLoadResult ProbeReloadResult;
+				const TSharedPtr<FAssimpScene> ProbeReloaded =
+					FAssimpScene::LoadFromFile(ProbeDestination, Settings, ProbeReloadResult);
+
+				FMeshDescription ProbeReloadedMesh;
+				if (TestTrue(TEXT("AxisProbe reimports"),
+					ProbeReloaded.IsValid() && ProbeReloaded->GetMeshDescription(0, ProbeReloadedMesh)))
+				{
+					FStaticMeshConstAttributes ProbeAttributes(ProbeMesh);
+					FStaticMeshConstAttributes ProbeReloadedAttributes(ProbeReloadedMesh);
+
+					const FBox ProbeBounds =
+						ComputeBounds(ProbeMesh, ProbeAttributes.GetVertexPositions());
+					const FBox ProbeReloadedBounds =
+						ComputeBounds(ProbeReloadedMesh, ProbeReloadedAttributes.GetVertexPositions());
+
+					AddInfo(FString::Printf(TEXT("AxisProbe bounds %s .. %s round-tripped to %s .. %s"),
+						*ProbeBounds.Min.ToString(), *ProbeBounds.Max.ToString(),
+						*ProbeReloadedBounds.Min.ToString(), *ProbeReloadedBounds.Max.ToString()));
+
+					TestTrue(FString::Printf(
+							TEXT("An asymmetric shape keeps its bounds (expected %s .. %s, got %s .. %s)"),
+							*ProbeBounds.Min.ToString(), *ProbeBounds.Max.ToString(),
+							*ProbeReloadedBounds.Min.ToString(), *ProbeReloadedBounds.Max.ToString()),
+						ProbeReloadedBounds.Min.Equals(ProbeBounds.Min, 0.01) &&
+						ProbeReloadedBounds.Max.Equals(ProbeBounds.Max, 0.01));
+				}
+			}
+		}
+	}
+
+	// --- Refusals ------------------------------------------------------------------------------------
+	// An unknown format must fail with an explanation rather than writing a broken file.
+	{
+		FAssimpExportResult BadResult;
+		const bool bBadExport = FAssimpExporter::ExportMeshes(
+			MakeArrayView(&ExportMesh, 1), DestinationPath, TEXT("definitely-not-a-format"), BadResult);
+
+		TestFalse(TEXT("An unknown format is refused"), bBadExport);
+		TestTrue(TEXT("The refusal explains itself"), !BadResult.ErrorMessage.IsEmpty());
 	}
 
 	return true;

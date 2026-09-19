@@ -112,14 +112,12 @@ private:
 	 *
 	 * @param BaseNodeContainer  Container to add track nodes to.
 	 * @param Scene              Parsed scene.
-	 * @param NodeIndexByName    First node index for each node name, for resolving bones.
 	 * @param SceneNodeUids      Scene node UID per node index.
 	 * @return                   Number of track sets emitted.
 	 */
 	int32 BuildAnimationTracks(
 		UInterchangeBaseNodeContainer& BaseNodeContainer,
 		const FAssimpScene& Scene,
-		const TMap<FString, int32>& NodeIndexByName,
 		const TArray<FString>& SceneNodeUids) const;
 
 	/**

@@ -30,6 +30,12 @@ returning a stored key. The translation and the rotation are on different source
 a basis change that only remaps translation, or that loses the sense of a rotation, passes a
 translation-only clip and fails this one.
 
+There is also one morph target, "Bulge", displacing every vertex one unit along source +Z -- which
+is one unit along Unreal's -X. The same displacement on every vertex is what makes the expected
+result trivial to state: the morphed shape is the base shape translated, so a conversion that got
+the basis right moves all four vertices identically, and one that did not moves them apart. The
+clip animates its weight from 0 to 1 over the same second.
+
 Both outputs are written from the same data. The .glb is not a separate fixture but the same scene
 in the binary container, which is what keeps the two from drifting apart.
 """
@@ -69,6 +75,24 @@ IDENTITY = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
 INVERSE_BONE1 = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, -1, 0, 1]
 
 INVERSE_BIND_MATRICES = [IDENTITY, INVERSE_BONE1]
+
+# ---------------------------------------------------------------------------------------------
+# Morph target
+# ---------------------------------------------------------------------------------------------
+
+MORPH_TARGET_NAME = "Bulge"
+
+# glTF morph targets hold DISPLACEMENTS, not absolute positions. Every vertex moves one unit along
+# source +Z, which the plugin's basis change (Unreal.X = -Source.Z) turns into one unit along
+# Unreal's -X. Displacing all four vertices by the same vector keeps the expected result trivially
+# checkable: the morphed mesh is the base mesh translated, so every vertex must move identically.
+MORPH_DISPLACEMENTS = [(0.0, 0.0, 1.0)] * 4
+
+# The weight the mesh rests at. Zero, so the base shape is the undeformed one.
+MORPH_REST_WEIGHT = 0.0
+
+# The clip drives the weight from fully off to fully on over its one second.
+MORPH_WEIGHT_KEYS = [0.0, 1.0]
 
 # ---------------------------------------------------------------------------------------------
 # Animation
@@ -122,6 +146,8 @@ def build_buffer():
     append("times", b"".join(struct.pack("<f", t) for t in ANIMATION_TIMES))
     append("anim_translations", b"".join(struct.pack("<3f", *t) for t in ANIMATION_TRANSLATIONS))
     append("anim_rotations", b"".join(struct.pack("<4f", *r) for r in ANIMATION_ROTATIONS))
+    append("morph_displacements", b"".join(struct.pack("<3f", *d) for d in MORPH_DISPLACEMENTS))
+    append("morph_weights", b"".join(struct.pack("<f", w) for w in MORPH_WEIGHT_KEYS))
 
     return b"".join(chunks), offsets
 
@@ -166,8 +192,14 @@ def build_gltf(embed_buffer=True):
                         "attributes": {"POSITION": 0, "JOINTS_0": 1, "WEIGHTS_0": 2},
                         "indices": 4,
                         "mode": 4,  # triangles
+                        "targets": [{"POSITION": 8}],
                     }
                 ],
+                # The rest weight, and the name. glTF has no first-class place for a morph target's
+                # name, so every exporter agrees on this extras convention instead -- and without a
+                # name Unreal has nothing to key the morph target by.
+                "weights": [MORPH_REST_WEIGHT],
+                "extras": {"targetNames": [MORPH_TARGET_NAME]},
             }
         ],
         "accessors": [
@@ -225,6 +257,22 @@ def build_gltf(embed_buffer=True):
                 "count": len(ANIMATION_ROTATIONS),
                 "type": "VEC4",
             },
+            {
+                # Morph displacements. min/max are required on a morph target's POSITION accessor.
+                "bufferView": 8,
+                "componentType": 5126,  # float
+                "count": len(MORPH_DISPLACEMENTS),
+                "type": "VEC3",
+                "min": [0.0, 0.0, 1.0],
+                "max": [0.0, 0.0, 1.0],
+            },
+            {
+                # One weight per target per keyframe; with a single target that is one per key.
+                "bufferView": 9,
+                "componentType": 5126,  # float
+                "count": len(MORPH_WEIGHT_KEYS),
+                "type": "SCALAR",
+            },
         ],
         "animations": [
             {
@@ -232,12 +280,16 @@ def build_gltf(embed_buffer=True):
                 "samplers": [
                     {"input": 5, "output": 6, "interpolation": "LINEAR"},
                     {"input": 5, "output": 7, "interpolation": "LINEAR"},
+                    {"input": 5, "output": 9, "interpolation": "LINEAR"},
                 ],
                 # Node 1 is Bone1. The root is deliberately left unanimated, so a clip that moved
                 # everything would not pass for one that moves the right thing.
                 "channels": [
                     {"sampler": 0, "target": {"node": 1, "path": "translation"}},
                     {"sampler": 1, "target": {"node": 1, "path": "rotation"}},
+                    # Node 2 is the mesh: a weights channel targets the node that draws it, not the
+                    # skeleton.
+                    {"sampler": 2, "target": {"node": 2, "path": "weights"}},
                 ],
             }
         ],
@@ -250,6 +302,8 @@ def build_gltf(embed_buffer=True):
             view("times", len(ANIMATION_TIMES) * 4),
             view("anim_translations", len(ANIMATION_TRANSLATIONS) * 12),
             view("anim_rotations", len(ANIMATION_ROTATIONS) * 16),
+            view("morph_displacements", len(MORPH_DISPLACEMENTS) * 12),
+            view("morph_weights", len(MORPH_WEIGHT_KEYS) * 4),
         ],
         "buffers": [{"byteLength": len(buffer_bytes)}],
     }

@@ -10,22 +10,23 @@ bool FAssimpSkeletonBuilder::Build(
 	const FAssimpAxisConverter& AxisConverter)
 {
 	Bones.Reset();
+	BoneNodes.Reset();
 	BoneNameToIndex.Reset();
 
-	TSet<const aiNode*> BoneNodes;
+	TSet<const aiNode*> ReferencedNodes;
 	TSet<FString> SkinningBoneNames;
 
-	if (!CollectBoneNodes(Scene, MeshIndices, BoneNodes, SkinningBoneNames))
+	if (!CollectBoneNodes(Scene, MeshIndices, ReferencedNodes, SkinningBoneNames))
 	{
 		return false;
 	}
 
-	const aiNode* Root = FindCommonAncestor(BoneNodes);
+	const aiNode* Root = FindCommonAncestor(ReferencedNodes);
 	if (Root == nullptr)
 	{
 		UE_LOG(LogAssimp, Warning,
 			TEXT("Found %d bone node(s) but no common ancestor; skeleton cannot be built."),
-			BoneNodes.Num());
+			ReferencedNodes.Num());
 		return false;
 	}
 
@@ -33,9 +34,9 @@ bool FAssimpSkeletonBuilder::Build(
 	// bone: those nodes carry transforms that position the bones below them, and pruning them would
 	// silently move the skeleton.
 	TSet<const aiNode*> RelevantNodes;
-	for (const aiNode* BoneNode : BoneNodes)
+	for (const aiNode* ReferencedNode : ReferencedNodes)
 	{
-		MarkPathToRoot(BoneNode, Root, RelevantNodes);
+		MarkPathToRoot(ReferencedNode, Root, RelevantNodes);
 	}
 
 	AddSubtree(Root, INDEX_NONE, RelevantNodes, SkinningBoneNames, AxisConverter);
@@ -226,6 +227,7 @@ void FAssimpSkeletonBuilder::AddSubtree(
 
 	// Depth-first insertion guarantees the parents-before-children order Unreal requires.
 	const int32 ThisIndex = Bones.Add(MoveTemp(Bone));
+	BoneNodes.Add(Node);
 
 	for (unsigned int ChildIndex = 0; ChildIndex < Node->mNumChildren; ++ChildIndex)
 	{

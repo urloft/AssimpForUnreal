@@ -55,9 +55,22 @@
       "WEIGHTS_0": 2
      },
      "indices": 4,
-     "mode": 4
+     "mode": 4,
+     "targets": [
+      {
+       "POSITION": 8
+      }
+     ]
     }
-   ]
+   ],
+   "weights": [
+    0.0
+   ],
+   "extras": {
+    "targetNames": [
+     "Bulge"
+    ]
+   }
   }
  ],
  "accessors": [
@@ -124,6 +137,28 @@
    "componentType": 5126,
    "count": 2,
    "type": "VEC4"
+  },
+  {
+   "bufferView": 8,
+   "componentType": 5126,
+   "count": 4,
+   "type": "VEC3",
+   "min": [
+    0.0,
+    0.0,
+    1.0
+   ],
+   "max": [
+    0.0,
+    0.0,
+    1.0
+   ]
+  },
+  {
+   "bufferView": 9,
+   "componentType": 5126,
+   "count": 2,
+   "type": "SCALAR"
   }
  ],
  "animations": [
@@ -138,6 +173,11 @@
     {
      "input": 5,
      "output": 7,
+     "interpolation": "LINEAR"
+    },
+    {
+     "input": 5,
+     "output": 9,
      "interpolation": "LINEAR"
     }
    ],
@@ -154,6 +194,13 @@
      "target": {
       "node": 1,
       "path": "rotation"
+     }
+    },
+    {
+     "sampler": 2,
+     "target": {
+      "node": 2,
+      "path": "weights"
      }
     }
    ]
@@ -199,12 +246,22 @@
    "buffer": 0,
    "byteOffset": 300,
    "byteLength": 32
+  },
+  {
+   "buffer": 0,
+   "byteOffset": 332,
+   "byteLength": 48
+  },
+  {
+   "buffer": 0,
+   "byteOffset": 380,
+   "byteLength": 8
   }
  ],
  "buffers": [
   {
-   "byteLength": 332,
-   "uri": "data:application/octet-stream;base64,AAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAACAPwAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAABAAAAAQAAAAAAgD8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAAAAAAIA/AACAPwAAAAAAAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAgL8AAAAAAACAPwAAAQACAAAAAgADAAAAAAAAAIA/AAAAAAAAgD8AAAAAAAAAQAAAgD8AAAAAAAAAAAAAAAAAAAAAAACAPwAAAADzBDU/AAAAAPMENT8="
+   "byteLength": 388,
+   "uri": "data:application/octet-stream;base64,AAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAACAPwAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAABAAAAAQAAAAAAgD8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAAAAAAIA/AACAPwAAAAAAAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAgL8AAAAAAACAPwAAAQACAAAAAgADAAAAAAAAAIA/AAAAAAAAgD8AAAAAAAAAQAAAgD8AAAAAAAAAAAAAAAAAAAAAAACAPwAAAADzBDU/AAAAAPMENT8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAAAAAAAAgD8AAAAAAACAPw=="
   }
  ]
 }

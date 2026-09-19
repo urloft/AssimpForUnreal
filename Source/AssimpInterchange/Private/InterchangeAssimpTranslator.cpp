@@ -8,6 +8,7 @@
 #include "AssimpScene.h"
 #include "AssimpSceneTypes.h"
 
+#include "Curves/RichCurve.h"
 #include "IImageWrapper.h"
 #include "IImageWrapperModule.h"
 #include "InterchangeAnimationTrackSetNode.h"
@@ -70,6 +71,18 @@ namespace AssimpInterchangePrivate
 	FString MakeAnimationPayloadKey(int32 AnimationIndex, int32 NodeIndex)
 	{
 		return FString::Printf(TEXT("%d;%d"), AnimationIndex, NodeIndex);
+	}
+
+	/**
+	 * Payload key for a morph target's animated weight: the clip and the morph target.
+	 *
+	 * Deliberately the same shape as a bone track's key. The second number means a different thing
+	 * in each, but the payload TYPE that travels with the key already says which -- so adding a
+	 * second format would only create a way for the two to disagree.
+	 */
+	FString MakeMorphWeightPayloadKey(int32 AnimationIndex, int32 MorphTargetIndex)
+	{
+		return MakeAnimationPayloadKey(AnimationIndex, MorphTargetIndex);
 	}
 
 	/** Decodes a key produced by MakeAnimationPayloadKey. */
@@ -138,6 +151,42 @@ namespace AssimpInterchangePrivate
 		default:
 			return false;
 		}
+	}
+
+	/**
+	 * Prefix marking a mesh payload key as a morph target rather than a set of meshes.
+	 *
+	 * The two share one payload entry point, and a bare number would be ambiguous between "mesh 3"
+	 * and "morph target 3". The prefix makes every key say which it is.
+	 */
+	const TCHAR* const MorphPayloadPrefix = TEXT("morph:");
+
+	FString MakeMorphPayloadKey(int32 MorphTargetIndex)
+	{
+		return FString::Printf(TEXT("%s%d"), MorphPayloadPrefix, MorphTargetIndex);
+	}
+
+	bool ParseMorphPayloadKey(const FString& Key, int32& OutMorphTargetIndex)
+	{
+		if (!Key.StartsWith(MorphPayloadPrefix))
+		{
+			return false;
+		}
+
+		const FString IndexPart = Key.RightChop(FCString::Strlen(MorphPayloadPrefix));
+		if (!IndexPart.IsNumeric())
+		{
+			return false;
+		}
+
+		OutMorphTargetIndex = FCString::Atoi(*IndexPart);
+		return true;
+	}
+
+	/** Morph-target node UID. */
+	FString MakeMorphTargetNodeUid(int32 MorphTargetIndex, const FString& MorphTargetName)
+	{
+		return FString::Printf(TEXT("\\MorphTarget\\%d_%s"), MorphTargetIndex, *MorphTargetName);
 	}
 
 	/** Encodes a set of mesh indices as a payload key. */
@@ -448,15 +497,6 @@ bool UInterchangeAssimpTranslator::Translate(UInterchangeBaseNodeContainer& Base
 	// Resolved before anything else is emitted, because it decides the shape of everything that
 	// follows: which scene nodes become joints, which meshes become one skeletal mesh instead of
 	// several static ones, and which skeleton each animation clip drives.
-	TMap<FString, int32> NodeIndexByName;
-	NodeIndexByName.Reserve(Info.Nodes.Num());
-	for (int32 NodeIndex = 0; NodeIndex < Info.Nodes.Num(); ++NodeIndex)
-	{
-		// First occurrence wins. Node names are not unique in most formats, and a bone reference
-		// names a node the same way Assimp itself resolves it: by the first match.
-		NodeIndexByName.FindOrAdd(Info.Nodes[NodeIndex].Name, NodeIndex);
-	}
-
 	// Scene node UIDs are derived from index and name, so they can be spelled before the nodes
 	// exist. That is what lets a skeletal mesh node name its skeleton root, which is emitted later.
 	TArray<FString> SceneNodeUids;
@@ -466,12 +506,19 @@ bool UInterchangeAssimpTranslator::Translate(UInterchangeBaseNodeContainer& Base
 		SceneNodeUids.Add(MakeSceneNodeUid(NodeIndex, Info.Nodes[NodeIndex].Name));
 	}
 
-	TSet<FString> JointNodeNames;
+	// By index, never by name. Assimp inserts a synthetic "ROOT" node above a glTF scene, and
+	// FString compares case-insensitively, so a scene whose own root bone is called "Root" would
+	// otherwise have that synthetic parent marked as a bone too -- putting the skeleton's apparent
+	// root one level above the real one, where the animation track set is not looking for it.
+	TSet<int32> JointNodeIndices;
 	for (const FAssimpSkinnedMeshGroup& Group : Info.SkinnedMeshGroups)
 	{
 		for (const FAssimpSkeletonBone& Bone : Group.Bones)
 		{
-			JointNodeNames.Add(Bone.Name);
+			if (Bone.NodeIndex != INDEX_NONE)
+			{
+				JointNodeIndices.Add(Bone.NodeIndex);
+			}
 		}
 	}
 
@@ -492,6 +539,50 @@ bool UInterchangeAssimpTranslator::Translate(UInterchangeBaseNodeContainer& Base
 	{
 		SkinnedMeshIndices.Append(Group.MeshIndices);
 	}
+
+	/**
+	 * Emits a morph-target mesh node per morph target of a source mesh, and makes the mesh depend
+	 * on it.
+	 *
+	 * A morph target is itself a mesh node in Interchange -- flagged as one, carrying its own
+	 * payload of the deformed shape -- which the factory subtracts from the base mesh to get the
+	 * deltas. It is reached only through the dependency, so a node without one is imported as an
+	 * ordinary mesh and the morph target silently disappears.
+	 */
+	auto AttachMorphTargets = [&Info, &BaseNodeContainer](UInterchangeMeshNode* MeshNode, int32 MeshIndex)
+	{
+		if (!Info.Meshes.IsValidIndex(MeshIndex))
+		{
+			return;
+		}
+
+		for (const int32 MorphTargetIndex : Info.Meshes[MeshIndex].MorphTargetIndices)
+		{
+			if (!Info.MorphTargets.IsValidIndex(MorphTargetIndex))
+			{
+				continue;
+			}
+
+			const FAssimpMorphTargetInfo& MorphTarget = Info.MorphTargets[MorphTargetIndex];
+			const FString MorphNodeUid = MakeMorphTargetNodeUid(MorphTargetIndex, MorphTarget.Name);
+
+			UInterchangeMeshNode* MorphNode = NewObject<UInterchangeMeshNode>(&BaseNodeContainer);
+			BaseNodeContainer.SetupNode(
+				MorphNode, MorphNodeUid, MorphTarget.Name,
+				EInterchangeNodeContainerType::TranslatedAsset);
+
+			MorphNode->SetMorphTarget(true);
+			MorphNode->SetMorphTargetName(MorphTarget.Name);
+			MorphNode->SetPayLoadKey(
+				MakeMorphPayloadKey(MorphTargetIndex), EInterchangeMeshPayLoadType::MORPHTARGET);
+
+			MorphNode->SetCustomVertexCount(Info.Meshes[MeshIndex].NumVertices);
+			MorphNode->SetCustomPolygonCount(Info.Meshes[MeshIndex].NumTriangles);
+			MorphNode->SetCustomHasVertexNormal(MorphTarget.bHasNormals);
+
+			MeshNode->SetMorphTargetDependencyUid(MorphNodeUid);
+		}
+	};
 
 	/** Attaches a mesh node's material slots. Slot names must match what FAssimpMeshConverter writes. */
 	auto BindMaterialSlots = [&Info, &MaterialNodeUids](UInterchangeMeshNode* MeshNode, int32 MeshIndex)
@@ -541,6 +632,7 @@ bool UInterchangeAssimpTranslator::Translate(UInterchangeBaseNodeContainer& Base
 		MeshNode->SetSkinnedMesh(false);
 
 		BindMaterialSlots(MeshNode, MeshIndex);
+		AttachMorphTargets(MeshNode, MeshIndex);
 	}
 
 	// One skeletal mesh node per skeleton, merging every mesh bound to it.
@@ -550,8 +642,8 @@ bool UInterchangeAssimpTranslator::Translate(UInterchangeBaseNodeContainer& Base
 	// index two different bone orderings.
 	for (const FAssimpSkinnedMeshGroup& Group : Info.SkinnedMeshGroups)
 	{
-		const int32* RootNodeIndex = NodeIndexByName.Find(Group.RootBoneName);
-		if (RootNodeIndex == nullptr || !SceneNodeUids.IsValidIndex(*RootNodeIndex))
+		const int32 RootNodeIndex = Group.Bones.IsEmpty() ? INDEX_NONE : Group.Bones[0].NodeIndex;
+		if (!SceneNodeUids.IsValidIndex(RootNodeIndex))
 		{
 			// The skeleton names a node the flattened hierarchy does not contain, which can only
 			// happen if the node walk hit its depth cap. Fall back to static import for these
@@ -579,7 +671,7 @@ bool UInterchangeAssimpTranslator::Translate(UInterchangeBaseNodeContainer& Base
 		MeshNode->SetPayLoadKey(
 			MakeMeshPayloadKey(Group.MeshIndices), EInterchangeMeshPayLoadType::SKELETAL);
 		MeshNode->SetSkinnedMesh(true);
-		MeshNode->SetSkeletonDependencyUid(SceneNodeUids[*RootNodeIndex]);
+		MeshNode->SetSkeletonDependencyUid(SceneNodeUids[RootNodeIndex]);
 
 		int32 TotalVertices = 0;
 		int32 TotalTriangles = 0;
@@ -603,6 +695,7 @@ bool UInterchangeAssimpTranslator::Translate(UInterchangeBaseNodeContainer& Base
 
 			MeshNodeUidForMesh[MeshIndex] = NodeUid;
 			BindMaterialSlots(MeshNode, MeshIndex);
+			AttachMorphTargets(MeshNode, MeshIndex);
 		}
 
 		MeshNode->SetCustomVertexCount(TotalVertices);
@@ -635,7 +728,7 @@ bool UInterchangeAssimpTranslator::Translate(UInterchangeBaseNodeContainer& Base
 		// A bone becomes a joint node rather than a plain scene node. That type is load-bearing: the
 		// skeletal mesh pipeline finds a skeleton by looking for a joint node whose parent is not
 		// one, so without it there is no skeleton, and therefore no skeletal mesh and no animation.
-		const bool bIsJoint = JointNodeNames.Contains(Node.Name);
+		const bool bIsJoint = JointNodeIndices.Contains(NodeIndex);
 
 		UInterchangeSceneNode* SceneNode = bIsJoint
 			? NewObject<UInterchangeJointNode>(&BaseNodeContainer)
@@ -701,8 +794,7 @@ bool UInterchangeAssimpTranslator::Translate(UInterchangeBaseNodeContainer& Base
 	// ---------------------------------------------------------------------------------------------
 	// Animation
 	// ---------------------------------------------------------------------------------------------
-	const int32 AnimationTrackCount =
-		BuildAnimationTracks(BaseNodeContainer, *Scene, NodeIndexByName, SceneNodeUids);
+	const int32 AnimationTrackCount = BuildAnimationTracks(BaseNodeContainer, *Scene, SceneNodeUids);
 
 	UE_LOG(LogAssimpInterchange, Log,
 		TEXT("Translated '%s': %d mesh node(s) (%d skeletal), %d material node(s), %d scene node(s), ")
@@ -717,7 +809,6 @@ bool UInterchangeAssimpTranslator::Translate(UInterchangeBaseNodeContainer& Base
 int32 UInterchangeAssimpTranslator::BuildAnimationTracks(
 	UInterchangeBaseNodeContainer& BaseNodeContainer,
 	const FAssimpScene& Scene,
-	const TMap<FString, int32>& NodeIndexByName,
 	const TArray<FString>& SceneNodeUids) const
 {
 	using namespace AssimpInterchangePrivate;
@@ -756,8 +847,8 @@ int32 UInterchangeAssimpTranslator::BuildAnimationTracks(
 
 		for (const FAssimpSkinnedMeshGroup& Group : Info.SkinnedMeshGroups)
 		{
-			const int32* RootNodeIndex = NodeIndexByName.Find(Group.RootBoneName);
-			if (RootNodeIndex == nullptr || !SceneNodeUids.IsValidIndex(*RootNodeIndex))
+			const int32 RootNodeIndex = Group.Bones.IsEmpty() ? INDEX_NONE : Group.Bones[0].NodeIndex;
+			if (!SceneNodeUids.IsValidIndex(RootNodeIndex))
 			{
 				continue;
 			}
@@ -773,23 +864,53 @@ int32 UInterchangeAssimpTranslator::BuildAnimationTracks(
 					continue;
 				}
 
-				const int32* BoneNodeIndex = NodeIndexByName.Find(Bone.Name);
-				if (BoneNodeIndex == nullptr || !SceneNodeUids.IsValidIndex(*BoneNodeIndex))
+				if (!SceneNodeUids.IsValidIndex(Bone.NodeIndex))
 				{
 					continue;
 				}
 
 				BonePayloads.Emplace(
-					SceneNodeUids[*BoneNodeIndex],
-					MakeAnimationPayloadKey(AnimationIndex, *BoneNodeIndex));
+					SceneNodeUids[Bone.NodeIndex],
+					MakeAnimationPayloadKey(AnimationIndex, Bone.NodeIndex));
 			}
 
-			if (BonePayloads.IsEmpty())
+			// Morph weights animated by this clip, for any mesh bound to this skeleton. They ride on
+			// the same track set as the bone tracks because Unreal stores both in one UAnimSequence.
+			TArray<TPair<FString, FString>> MorphPayloads;
+			for (const int32 MeshIndex : Group.MeshIndices)
+			{
+				if (!Info.Meshes.IsValidIndex(MeshIndex))
+				{
+					continue;
+				}
+
+				for (const int32 MorphTargetIndex : Info.Meshes[MeshIndex].MorphTargetIndices)
+				{
+					if (!Info.MorphTargets.IsValidIndex(MorphTargetIndex))
+					{
+						continue;
+					}
+
+					TArray<float> Times;
+					TArray<float> Weights;
+					if (!Scene.GetMorphTargetWeightCurve(AnimationIndex, MorphTargetIndex, Times, Weights))
+					{
+						continue;
+					}
+
+					const FAssimpMorphTargetInfo& MorphTarget = Info.MorphTargets[MorphTargetIndex];
+					MorphPayloads.Emplace(
+						MakeMorphTargetNodeUid(MorphTargetIndex, MorphTarget.Name),
+						MakeMorphWeightPayloadKey(AnimationIndex, MorphTargetIndex));
+				}
+			}
+
+			if (BonePayloads.IsEmpty() && MorphPayloads.IsEmpty())
 			{
 				continue;
 			}
 
-			const FString& SkeletonRootUid = SceneNodeUids[*RootNodeIndex];
+			const FString& SkeletonRootUid = SceneNodeUids[RootNodeIndex];
 
 			UInterchangeSkeletalAnimationTrackNode* TrackNode =
 				NewObject<UInterchangeSkeletalAnimationTrackNode>(&BaseNodeContainer);
@@ -815,18 +936,27 @@ int32 UInterchangeAssimpTranslator::BuildAnimationTracks(
 					BonePayload.Key, BonePayload.Value, EInterchangeAnimationPayLoadType::BAKED);
 			}
 
+			for (const TPair<FString, FString>& MorphPayload : MorphPayloads)
+			{
+				TrackNode->SetAnimationPayloadKeyForMorphTargetNodeUid(
+					MorphPayload.Key, MorphPayload.Value,
+					EInterchangeAnimationPayLoadType::MORPHTARGETCURVE);
+			}
+
 			++TrackSetCount;
 		}
 
-		if (Animation.bHasMeshOrMorphChannels)
+		if (Animation.bHasMeshOrMorphChannels && Info.MorphTargets.IsEmpty())
 		{
-			// Said once per clip, because the alternative is a clip that imports looking complete
-			// while the deformation the artist authored is simply absent.
+			// Morph-target weights are imported when the meshes actually carry morph targets. A clip
+			// that animates them where none exist is worth saying out loud: it usually means morph
+			// import is switched off, and the alternative is a clip that looks complete while the
+			// deformation the artist authored is simply absent.
 			UInterchangeResultWarning_Generic* Message = AddMessage<UInterchangeResultWarning_Generic>();
 			Message->SourceAssetName = FPaths::GetCleanFilename(Info.SourceFilePath);
 			Message->Text = FText::Format(
-				LOCTEXT("MorphChannelsDropped",
-					"Animation '{0}' also animates mesh or morph-target channels. Those are not imported; only bone tracks were."),
+				LOCTEXT("MorphChannelsWithoutTargets",
+					"Animation '{0}' animates morph or mesh channels, but no morph targets were imported for it to drive. Check that morph target import is enabled."),
 				FText::FromString(Animation.Name));
 		}
 	}
@@ -849,6 +979,20 @@ TOptional<UE::Interchange::FMeshPayloadData> UInterchangeAssimpTranslator::GetMe
 	if (!Scene.IsValid())
 	{
 		return TOptional<FMeshPayloadData>();
+	}
+
+	// A morph target is requested through this same entry point, distinguished by its key. Its
+	// payload is the deformed shape of one mesh, which the factory diffs against the base.
+	int32 MorphTargetIndex = INDEX_NONE;
+	if (ParseMorphPayloadKey(PayLoadKey.UniqueId, MorphTargetIndex))
+	{
+		FMeshPayloadData MorphPayloadData;
+		if (!Scene->GetMorphTargetMeshDescription(MorphTargetIndex, MorphPayloadData.MeshDescription))
+		{
+			return TOptional<FMeshPayloadData>();
+		}
+
+		return MorphPayloadData;
 	}
 
 	TArray<int32> MeshIndices;
@@ -932,12 +1076,16 @@ TArray<UE::Interchange::FAnimationPayloadData> UInterchangeAssimpTranslator::Get
 
 	for (const FAnimationPayloadQuery& Query : PayloadQueries)
 	{
-		// Only baked transforms are offered, and the track nodes only ever ask for them. Anything
-		// else means the graph and this provider have drifted apart, which is worth saying out loud.
-		if (Query.PayloadKey.Type != EInterchangeAnimationPayLoadType::BAKED)
+		// Two payload types are produced: baked bone transforms, and morph-target weight curves. The
+		// key format is shared, so the type is what says which of the two a request means.
+		const bool bIsBaked = Query.PayloadKey.Type == EInterchangeAnimationPayLoadType::BAKED;
+		const bool bIsMorphCurve =
+			Query.PayloadKey.Type == EInterchangeAnimationPayLoadType::MORPHTARGETCURVE;
+
+		if (!bIsBaked && !bIsMorphCurve)
 		{
 			UE_LOG(LogAssimpInterchange, Warning,
-				TEXT("Animation payload '%s' requested as type %d; only baked transforms are produced."),
+				TEXT("Animation payload '%s' requested as type %d, which this translator does not produce."),
 				*Query.PayloadKey.UniqueId, static_cast<int32>(Query.PayloadKey.Type));
 			continue;
 		}
@@ -948,6 +1096,33 @@ TArray<UE::Interchange::FAnimationPayloadData> UInterchangeAssimpTranslator::Get
 		{
 			UE_LOG(LogAssimpInterchange, Error,
 				TEXT("Unrecognised animation payload key '%s'."), *Query.PayloadKey.UniqueId);
+			continue;
+		}
+
+		if (bIsMorphCurve)
+		{
+			// Here the second number is a morph target index, not a scene node index.
+			TArray<float> Times;
+			TArray<float> Weights;
+			if (!Scene->GetMorphTargetWeightCurve(AnimationIndex, NodeIndex, Times, Weights))
+			{
+				continue;
+			}
+
+			FAnimationPayloadData MorphPayloadData(Query.SceneNodeUniqueID, Query.PayloadKey);
+			MorphPayloadData.Curves.SetNum(1);
+
+			for (int32 KeyIndex = 0; KeyIndex < Times.Num(); ++KeyIndex)
+			{
+				// Linear, because that is what every format this reaches actually stores: Assimp
+				// exposes morph weights as plain time/value pairs with no tangent information, so
+				// claiming anything smoother would be inventing curvature the file never had.
+				const FKeyHandle Handle =
+					MorphPayloadData.Curves[0].AddKey(Times[KeyIndex], Weights[KeyIndex]);
+				MorphPayloadData.Curves[0].SetKeyInterpMode(Handle, ERichCurveInterpMode::RCIM_Linear);
+			}
+
+			Payloads.Add(MoveTemp(MorphPayloadData));
 			continue;
 		}
 

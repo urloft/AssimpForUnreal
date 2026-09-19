@@ -217,6 +217,37 @@ public:
 		TArray<FString>& OutJointNames) const;
 
 	/**
+	 * Converts one morph target to an FMeshDescription holding the deformed shape.
+	 *
+	 * Not a delta: Assimp stores morph targets as whole replacement arrays, and Unreal's factory
+	 * works out the difference itself by comparing this against the base mesh. That comparison is
+	 * per vertex index, so this deliberately runs the same conversion as GetMeshDescription with
+	 * only the positions and normals substituted -- anything else risks a different vertex order and
+	 * a morph target that tears the mesh apart instead of deforming it.
+	 *
+	 * @param MorphTargetIndex    Index into GetSceneInfo().MorphTargets.
+	 * @param OutMeshDescription  Populated on success.
+	 */
+	bool GetMorphTargetMeshDescription(
+		int32 MorphTargetIndex,
+		FMeshDescription& OutMeshDescription) const;
+
+	/**
+	 * Samples a morph target's animated weight across a time range.
+	 *
+	 * @param AnimationIndex    Index into GetSceneInfo().Animations.
+	 * @param MorphTargetIndex  Index into GetSceneInfo().MorphTargets.
+	 * @param OutTimes          Key times in seconds.
+	 * @param OutWeights        Weight at each of those times, in the range [0, 1].
+	 * @return                  False when the clip does not animate that target's weight.
+	 */
+	bool GetMorphTargetWeightCurve(
+		int32 AnimationIndex,
+		int32 MorphTargetIndex,
+		TArray<float>& OutTimes,
+		TArray<float>& OutWeights) const;
+
+	/**
 	 * Frame rate one animation clip should be baked at.
 	 *
 	 * Not simply the file's ticks-per-second: that is a timebase (glTF counts in milliseconds,

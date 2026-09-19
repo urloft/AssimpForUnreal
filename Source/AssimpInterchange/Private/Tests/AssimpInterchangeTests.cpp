@@ -7,6 +7,13 @@
 #include "InterchangeSourceData.h"
 
 #include "Animation/AnimData/IAnimationDataModel.h"
+#include "Animation/InterchangeAnimationPayloadInterface.h"
+#include "Curves/RichCurve.h"
+#include "InterchangeAnimationTrackSetNode.h"
+#include "InterchangeCommonAnimationPayload.h"
+#include "InterchangeJointNode.h"
+#include "InterchangeMeshNode.h"
+#include "InterchangeResult.h"
 #include "Animation/AnimSequence.h"
 #include "Animation/Skeleton.h"
 #include "Engine/SkeletalMesh.h"
@@ -428,6 +435,199 @@ bool FAssimpImportSkeletalAnimationTest::RunTest(const FString& /*Parameters*/)
 	}
 
 	Cleanup();
+
+	return true;
+}
+
+// =================================================================================================
+// Node graph
+// =================================================================================================
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FAssimpTranslateMorphTargetGraphTest,
+	"AssimpForUnreal.Interchange.TranslateMorphTargets",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+/**
+ * Asserts the node graph a morph-target file translates into, by driving the translator directly.
+ *
+ * Direct rather than through UInterchangeManager, because the only fixture that carries skinning and
+ * morph targets together is glTF, and glTF is claimed by the engine's own translator too -- an
+ * import would silently be handled by whichever of the two the manager's set iteration reached
+ * first, so it could never assert anything about this one. Constructing the translator removes the
+ * contest entirely.
+ *
+ * What it cannot show is that the engine's factories then produce a UMorphTarget; the skeletal
+ * animation test covers that half of the contract for a file this plugin does win. What it does show
+ * is the part that is this plugin's to get right: that a morph target is emitted as its own mesh
+ * node, flagged as one, depended on by the mesh it deforms, and reachable by the payload key it
+ * advertises -- and that its animated weight is attached to the track set as a curve.
+ */
+bool FAssimpTranslateMorphTargetGraphTest::RunTest(const FString& /*Parameters*/)
+{
+	using namespace AssimpInterchangeTestUtils;
+
+	const FString FilePath = GetTestDataPath(TEXT("SkinnedQuad.gltf"));
+	if (!TestTrue(TEXT("Test fixture path resolved"), !FilePath.IsEmpty()))
+	{
+		return false;
+	}
+
+	UInterchangeSourceData* SourceData = UInterchangeManager::CreateSourceData(FilePath);
+	if (!TestNotNull(TEXT("Source data created"), SourceData))
+	{
+		return false;
+	}
+
+	UInterchangeAssimpTranslator* Translator = NewObject<UInterchangeAssimpTranslator>();
+	Translator->SourceData = SourceData;
+	Translator->Results = NewObject<UInterchangeResultsContainer>();
+
+	UInterchangeBaseNodeContainer* Container = NewObject<UInterchangeBaseNodeContainer>();
+
+	if (!TestTrue(TEXT("Translate succeeded"), Translator->Translate(*Container)))
+	{
+		return false;
+	}
+
+	// --- Collect what was emitted ----------------------------------------------------------------
+	const UInterchangeMeshNode* SkeletalMeshNode = nullptr;
+	const UInterchangeMeshNode* MorphNode = nullptr;
+	const UInterchangeSkeletalAnimationTrackNode* TrackNode = nullptr;
+	TArray<FString> JointNodeLabels;
+
+	Container->IterateNodes([&](const FString& NodeUid, UInterchangeBaseNode* Node)
+	{
+		if (const UInterchangeMeshNode* MeshNode = Cast<UInterchangeMeshNode>(Node))
+		{
+			if (MeshNode->IsMorphTarget())
+			{
+				MorphNode = MeshNode;
+			}
+			else if (MeshNode->IsSkinnedMesh())
+			{
+				SkeletalMeshNode = MeshNode;
+			}
+		}
+		else if (const UInterchangeSkeletalAnimationTrackNode* Track =
+			Cast<UInterchangeSkeletalAnimationTrackNode>(Node))
+		{
+			TrackNode = Track;
+		}
+		else if (Node->IsA(UInterchangeJointNode::StaticClass()))
+		{
+			JointNodeLabels.Add(Node->GetDisplayLabel());
+		}
+	});
+
+	// Exactly the skeleton's bones must be joint nodes -- no more. A bone emitted as a plain scene
+	// node leaves the pipeline with no skeleton to find; an extra one changes where the pipeline
+	// decides the skeleton is rooted, since it looks for a joint whose parent is not one.
+	JointNodeLabels.Sort();
+	AddInfo(FString::Printf(TEXT("Joint nodes: %s"), *FString::Join(JointNodeLabels, TEXT(", "))));
+
+	TestEqual(TEXT("Exactly the two bones became joint nodes"), JointNodeLabels.Num(), 2);
+	TestTrue(TEXT("Root is a joint"), JointNodeLabels.Contains(TEXT("Root")));
+	TestTrue(TEXT("Bone1 is a joint"), JointNodeLabels.Contains(TEXT("Bone1")));
+
+	if (!TestNotNull(TEXT("A skinned mesh node was emitted"), SkeletalMeshNode) ||
+		!TestNotNull(TEXT("A morph target node was emitted"), MorphNode))
+	{
+		return false;
+	}
+
+	// --- The morph target node --------------------------------------------------------------------
+	FString MorphTargetName;
+	MorphNode->GetMorphTargetName(MorphTargetName);
+	AddInfo(FString::Printf(TEXT("Morph target node '%s' named '%s'"),
+		*MorphNode->GetUniqueID(), *MorphTargetName));
+
+	TestEqual(TEXT("Morph target node carries the file's name"),
+		MorphTargetName, FString(TEXT("Bulge")));
+
+	// The dependency is the only route from the mesh to the morph target. Without it the morph node
+	// is orphaned and never imported.
+	TArray<FString> MorphDependencies;
+	SkeletalMeshNode->GetMorphTargetDependencies(MorphDependencies);
+
+	TestTrue(TEXT("The skinned mesh depends on the morph target node"),
+		MorphDependencies.Contains(MorphNode->GetUniqueID()));
+
+	// --- The morph target's payload ----------------------------------------------------------------
+	const TOptional<FInterchangeMeshPayLoadKey> MorphPayloadKey = MorphNode->GetPayLoadKey();
+	if (TestTrue(TEXT("Morph target node advertises a payload key"), MorphPayloadKey.IsSet()))
+	{
+		const FInterchangeMeshPayLoadKey& Key = MorphPayloadKey.GetValue();
+
+		TestEqual(TEXT("The payload is typed as a morph target"),
+			Key.Type, EInterchangeMeshPayLoadType::MORPHTARGET);
+
+		UE::Interchange::FAttributeStorage Attributes;
+		const TOptional<UE::Interchange::FMeshPayloadData> Payload =
+			Translator->GetMeshPayloadData(Key, Attributes);
+
+		if (TestTrue(TEXT("The morph target payload resolves"), Payload.IsSet()))
+		{
+			// Four vertices, the same as the base mesh: the correspondence Unreal diffs against.
+			TestEqual(TEXT("Morph target payload has the mesh's four vertices"),
+				Payload.GetValue().MeshDescription.Vertices().Num(), 4);
+			TestEqual(TEXT("Morph target payload has the mesh's two triangles"),
+				Payload.GetValue().MeshDescription.Triangles().Num(), 2);
+		}
+	}
+
+	// --- The animated weight -----------------------------------------------------------------------
+	if (!TestNotNull(TEXT("A skeletal animation track node was emitted"), TrackNode))
+	{
+		return false;
+	}
+
+	TMap<FString, FString> MorphPayloadUids;
+	TMap<FString, uint8> MorphPayloadTypes;
+	TrackNode->GetMorphTargetNodeAnimationPayloadKeys(MorphPayloadUids, MorphPayloadTypes);
+
+	AddInfo(FString::Printf(TEXT("Track set carries %d morph payload key(s)"), MorphPayloadUids.Num()));
+
+	const FString* WeightPayloadKey = MorphPayloadUids.Find(MorphNode->GetUniqueID());
+	if (TestNotNull(TEXT("The track set drives the morph target's weight"), WeightPayloadKey))
+	{
+		const uint8* PayloadType = MorphPayloadTypes.Find(MorphNode->GetUniqueID());
+		if (TestNotNull(TEXT("The weight payload declares a type"), PayloadType))
+		{
+			TestEqual(TEXT("Weight payloads are curves, not baked transforms"),
+				static_cast<EInterchangeAnimationPayLoadType>(*PayloadType),
+				EInterchangeAnimationPayLoadType::MORPHTARGETCURVE);
+		}
+
+		// Fetch it, so the key is proved to resolve rather than merely to exist.
+		TArray<UE::Interchange::FAnimationPayloadQuery> Queries;
+		Queries.Emplace(
+			MorphNode->GetUniqueID(),
+			FInterchangeAnimationPayLoadKey(
+				*WeightPayloadKey, EInterchangeAnimationPayLoadType::MORPHTARGETCURVE));
+
+		const TArray<UE::Interchange::FAnimationPayloadData> Payloads =
+			Translator->GetAnimationPayloadData(Queries);
+
+		if (TestEqual(TEXT("One weight payload came back"), Payloads.Num(), 1))
+		{
+			if (TestEqual(TEXT("The payload holds a single curve"), Payloads[0].Curves.Num(), 1))
+			{
+				const FRichCurve& Curve = Payloads[0].Curves[0];
+				AddInfo(FString::Printf(TEXT("Weight curve has %d key(s)"), Curve.GetNumKeys()));
+
+				TestTrue(TEXT("The weight curve has keys"), Curve.GetNumKeys() >= 2);
+
+				// 0 to 1 across the clip's second, which is what the fixture animates.
+				TestTrue(FString::Printf(TEXT("Weight is 0 at the start (got %.4f)"), Curve.Eval(0.0f)),
+					FMath::IsNearlyEqual(Curve.Eval(0.0f), 0.0f, 0.01f));
+				TestTrue(FString::Printf(TEXT("Weight is 1 at the end (got %.4f)"), Curve.Eval(1.0f)),
+					FMath::IsNearlyEqual(Curve.Eval(1.0f), 1.0f, 0.01f));
+			}
+		}
+	}
+
+	Translator->ReleaseSource();
 
 	return true;
 }

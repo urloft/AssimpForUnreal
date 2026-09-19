@@ -90,3 +90,29 @@ FTransform FAssimpAxisConverter::ConvertTransform(const aiMatrix4x4& In) const
 
 	return FTransform(Result);
 }
+
+aiMatrix4x4 FAssimpAxisConverter::InvertTransform(const FTransform& In) const
+{
+	FMatrix Result = In.ToMatrixWithScale();
+
+	// Undo the scale that ConvertTransform applied to the translation row.
+	const float InverseScale = (AppliedScale != 0.0f) ? 1.0f / AppliedScale : 1.0f;
+	Result.M[3][0] *= InverseScale;
+	Result.M[3][1] *= InverseScale;
+	Result.M[3][2] *= InverseScale;
+
+	if (!bIdentityBasis)
+	{
+		// ConvertTransform computes B * M * B^-1, so the inverse is B^-1 * M * B.
+		Result = InverseBasis * Result * Basis;
+	}
+
+	// And transpose back out of Unreal's row-vector convention into Assimp's column-vector one.
+	aiMatrix4x4 Out;
+	Out.a1 = Result.M[0][0]; Out.b1 = Result.M[0][1]; Out.c1 = Result.M[0][2]; Out.d1 = Result.M[0][3];
+	Out.a2 = Result.M[1][0]; Out.b2 = Result.M[1][1]; Out.c2 = Result.M[1][2]; Out.d2 = Result.M[1][3];
+	Out.a3 = Result.M[2][0]; Out.b3 = Result.M[2][1]; Out.c3 = Result.M[2][2]; Out.d3 = Result.M[2][3];
+	Out.a4 = Result.M[3][0]; Out.b4 = Result.M[3][1]; Out.c4 = Result.M[3][2]; Out.d4 = Result.M[3][3];
+
+	return Out;
+}

@@ -273,6 +273,50 @@ namespace
 		}
 	}
 
+	/**
+	 * Builds an Unreal transform from a source-space position and a forward/up pair.
+	 *
+	 * Assimp gives a camera its mLookAt and mUp, and a light its mDirection and mUp, as vectors in
+	 * the space of the node they hang off. Unreal instead orients both by the component's rotation,
+	 * with +X as the direction it looks or shines along. Converting the two vectors individually and
+	 * building a frame from them is what bridges that -- and it is correct across the handedness
+	 * flip precisely because each vector carries the reflection already.
+	 *
+	 * Degenerate input is real: files ship zero-length look vectors, and some exporters leave mUp at
+	 * zero. Either would make the frame singular, so both fall back to an axis rather than producing
+	 * a rotation full of NaN that only shows up as an invisible actor much later.
+	 */
+	FTransform MakeOrientedTransform(
+		const FAssimpAxisConverter& AxisConverter,
+		const aiVector3D& Position,
+		const aiVector3D& Forward,
+		const aiVector3D& Up)
+	{
+		FVector ForwardUnreal(AxisConverter.ConvertDirection(Forward));
+		FVector UpUnreal(AxisConverter.ConvertDirection(Up));
+
+		if (!ForwardUnreal.Normalize())
+		{
+			ForwardUnreal = FVector::ForwardVector;
+		}
+		if (!UpUnreal.Normalize())
+		{
+			UpUnreal = FVector::UpVector;
+		}
+
+		// Parallel forward and up leave MakeFromXZ nothing to orthogonalise against.
+		if (FMath::IsNearlyEqual(FMath::Abs(ForwardUnreal | UpUnreal), 1.0, UE_KINDA_SMALL_NUMBER))
+		{
+			UpUnreal = FMath::IsNearlyEqual(FMath::Abs(ForwardUnreal.Z), 1.0, UE_KINDA_SMALL_NUMBER)
+				? FVector::ForwardVector
+				: FVector::UpVector;
+		}
+
+		const FQuat Rotation = FRotationMatrix::MakeFromXZ(ForwardUnreal, UpUnreal).ToQuat();
+
+		return FTransform(Rotation, FVector(AxisConverter.ConvertPosition(Position)));
+	}
+
 	/** Maps Assimp's light type onto ours. */
 	EAssimpLightType ConvertLightType(aiLightSourceType Type)
 	{
@@ -334,8 +378,17 @@ struct FAssimpScene::FImpl
 	void BuildMeshes();
 	void BuildNodeHierarchy();
 	void BuildCamerasAndLights();
+
+	/**
+	 * Index of the first node with a given name, or INDEX_NONE.
+	 *
+	 * Assimp ties a camera or light to its node by name and nothing else, and names are not unique
+	 * in most formats -- so first-match is the same rule Assimp's own consumers apply.
+	 */
+	int32 FindNodeIndexByName(const FString& NodeName) const;
 	void BuildAnimations();
 	void BuildSkinnedMeshGroups();
+	void BuildMorphTargets();
 
 	/** Recursive helper for BuildNodeHierarchy. */
 	int32 AddNodeRecursive(const aiNode* Node, int32 ParentIndex, int32 Depth);
@@ -349,6 +402,15 @@ struct FAssimpScene::FImpl
 	 * 256 is far beyond any legitimate scene graph while leaving the stack intact.
 	 */
 	static constexpr int32 MaxNodeDepth = 256;
+
+	/**
+	 * Flattened index of each source node, keyed by identity.
+	 *
+	 * Built during the node walk so that anything needing to point at a node -- a bone, a camera, a
+	 * light -- can do so exactly, rather than by matching names that are neither unique nor, under
+	 * FString's case-insensitive comparison, reliably distinct.
+	 */
+	TMap<const aiNode*, int32> NodeIndexByPointer;
 
 	/** Set once the depth cap has been reported, so one file yields one warning rather than many. */
 	bool bNodeDepthExceeded = false;
@@ -848,6 +910,137 @@ bool FAssimpScene::GetMergedMeshDescription(
 	return bSucceeded;
 }
 
+bool FAssimpScene::GetMorphTargetMeshDescription(
+	int32 MorphTargetIndex,
+	FMeshDescription& OutMeshDescription) const
+{
+	if (Impl->Scene == nullptr || !Impl->AxisConverter.IsValid())
+	{
+		UE_LOG(LogAssimp, Error, TEXT("GetMorphTargetMeshDescription called on an unloaded scene."));
+		return false;
+	}
+
+	if (!Impl->SceneInfo.MorphTargets.IsValidIndex(MorphTargetIndex))
+	{
+		return false;
+	}
+
+	const FAssimpMorphTargetInfo& MorphTarget = Impl->SceneInfo.MorphTargets[MorphTargetIndex];
+
+	const int32 MeshIndices[1] = { MorphTarget.MeshIndex };
+
+	FString Error;
+	TArray<FString> UnusedJointNames;
+	const bool bSucceeded = FAssimpMeshConverter::Convert(
+		*Impl->Scene,
+		MeshIndices,
+		*Impl->AxisConverter,
+		Impl->Settings,
+		OutMeshDescription,
+		UnusedJointNames,
+		Error,
+		MorphTarget.MorphIndex);
+
+	if (!bSucceeded)
+	{
+		UE_LOG(LogAssimp, Error, TEXT("Morph target conversion failed: %s"), *Error);
+	}
+
+	return bSucceeded;
+}
+
+bool FAssimpScene::GetMorphTargetWeightCurve(
+	int32 AnimationIndex,
+	int32 MorphTargetIndex,
+	TArray<float>& OutTimes,
+	TArray<float>& OutWeights) const
+{
+	OutTimes.Reset();
+	OutWeights.Reset();
+
+	const aiAnimation* Animation = Impl->FindAnimation(AnimationIndex);
+	if (Animation == nullptr || Animation->mMorphMeshChannels == nullptr)
+	{
+		return false;
+	}
+
+	if (!Impl->SceneInfo.MorphTargets.IsValidIndex(MorphTargetIndex))
+	{
+		return false;
+	}
+
+	const FAssimpMorphTargetInfo& MorphTarget = Impl->SceneInfo.MorphTargets[MorphTargetIndex];
+
+	// A morph channel names the node whose mesh it drives, and the file's own mesh names are what
+	// tie the two together. Matching on the mesh name rather than the node name is what keeps this
+	// working when one mesh is instanced under several nodes.
+	const FString MeshName = Impl->SceneInfo.Meshes.IsValidIndex(MorphTarget.MeshIndex)
+		? Impl->SceneInfo.Meshes[MorphTarget.MeshIndex].Name
+		: FString();
+
+	const double TicksPerSecond = FAssimpAnimationConverter::GetTicksPerSecond(*Animation);
+
+	for (unsigned int ChannelIndex = 0; ChannelIndex < Animation->mNumMorphMeshChannels; ++ChannelIndex)
+	{
+		const aiMeshMorphAnim* Channel = Animation->mMorphMeshChannels[ChannelIndex];
+		if (Channel == nullptr || Channel->mKeys == nullptr)
+		{
+			continue;
+		}
+
+		const FString ChannelName = FAssimpAxisConverter::ConvertString(Channel->mName);
+
+		// Exporters disagree on whether the channel carries the mesh's name or the node's, so both
+		// are accepted. Anything stricter drops the animation entirely on half the files that have
+		// it, and the two names are rarely ambiguous in practice.
+		const bool bMatchesMesh = !MeshName.IsEmpty() && ChannelName == MeshName;
+		const bool bMatchesNode = Impl->SceneInfo.Nodes.ContainsByPredicate(
+			[&ChannelName, &MorphTarget, this](const FAssimpNodeInfo& Node)
+			{
+				return Node.Name == ChannelName && Node.MeshIndices.Contains(MorphTarget.MeshIndex);
+			});
+
+		if (!bMatchesMesh && !bMatchesNode)
+		{
+			continue;
+		}
+
+		OutTimes.Reserve(static_cast<int32>(Channel->mNumKeys));
+		OutWeights.Reserve(static_cast<int32>(Channel->mNumKeys));
+
+		for (unsigned int KeyIndex = 0; KeyIndex < Channel->mNumKeys; ++KeyIndex)
+		{
+			const aiMeshMorphKey& Key = Channel->mKeys[KeyIndex];
+			if (Key.mValues == nullptr || Key.mWeights == nullptr)
+			{
+				continue;
+			}
+
+			// Each key lists the targets it touches and their weights, so a target absent from a key
+			// is not animated at that time. Holding the previous value is the right reading: the
+			// alternative, inserting a zero, would make every unmentioned target flicker to rest.
+			for (unsigned int Entry = 0; Entry < Key.mNumValuesAndWeights; ++Entry)
+			{
+				if (static_cast<int32>(Key.mValues[Entry]) != MorphTarget.MorphIndex)
+				{
+					continue;
+				}
+
+				OutTimes.Add(static_cast<float>(Key.mTime / TicksPerSecond));
+				OutWeights.Add(FMath::Clamp(static_cast<float>(Key.mWeights[Entry]), 0.0f, 1.0f));
+				break;
+			}
+		}
+
+		if (!OutTimes.IsEmpty())
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
 double FAssimpScene::GetAnimationSampleRate(int32 AnimationIndex) const
 {
 	const aiAnimation* Animation = Impl->FindAnimation(AnimationIndex);
@@ -1034,11 +1227,81 @@ void FAssimpScene::FImpl::BuildSceneInfo()
 	BuildCamerasAndLights();
 
 	// Skeletons before animations: a clip is only worth describing once it is known which skeleton
-	// it can drive, and both are needed before any payload is requested.
+	// it can drive, and both are needed before any payload is requested. Morph targets likewise,
+	// since a clip can animate their weights.
 	BuildSkinnedMeshGroups();
+	BuildMorphTargets();
 	BuildAnimations();
 
 	SceneInfo.NumEmbeddedTextures = static_cast<int32>(Scene->mNumTextures);
+}
+
+void FAssimpScene::FImpl::BuildMorphTargets()
+{
+	if (!Settings.bImportMorphTargets || Scene->mMeshes == nullptr)
+	{
+		return;
+	}
+
+	for (int32 MeshIndex = 0; MeshIndex < SceneInfo.Meshes.Num(); ++MeshIndex)
+	{
+		const aiMesh* Mesh = Scene->mMeshes[MeshIndex];
+		if (Mesh == nullptr || Mesh->mAnimMeshes == nullptr || Mesh->mNumAnimMeshes == 0)
+		{
+			continue;
+		}
+
+		for (unsigned int MorphIndex = 0; MorphIndex < Mesh->mNumAnimMeshes; ++MorphIndex)
+		{
+			const aiAnimMesh* AnimMesh = Mesh->mAnimMeshes[MorphIndex];
+			if (AnimMesh == nullptr)
+			{
+				continue;
+			}
+
+			// A target that replaces nothing deforms nothing. Importing it would produce a morph
+			// target identical to the base mesh, which Unreal records as an empty delta set and the
+			// user then sees as a slider that does nothing.
+			if (AnimMesh->mVertices == nullptr && AnimMesh->mNormals == nullptr)
+			{
+				continue;
+			}
+
+			if (AnimMesh->mNumVertices != Mesh->mNumVertices)
+			{
+				UE_LOG(LogAssimp, Warning,
+					TEXT("Morph target %u of mesh '%s' has %u vertices but the mesh has %u; skipped."),
+					MorphIndex, *SceneInfo.Meshes[MeshIndex].Name,
+					AnimMesh->mNumVertices, Mesh->mNumVertices);
+				continue;
+			}
+
+			FAssimpMorphTargetInfo Info;
+			Info.Name = FAssimpAxisConverter::ConvertString(AnimMesh->mName);
+			Info.MeshIndex = MeshIndex;
+			Info.MorphIndex = static_cast<int32>(MorphIndex);
+			Info.Weight = FMath::Clamp(AnimMesh->mWeight, 0.0f, 1.0f);
+			Info.bHasNormals = AnimMesh->mNormals != nullptr;
+
+			// Unreal keys morph targets by name, so an unnamed one could never be driven -- and
+			// several unnamed ones on one mesh would collide. glTF in particular names them only
+			// through an optional extras field most exporters omit.
+			if (Info.Name.IsEmpty())
+			{
+				Info.Name = FString::Printf(
+					TEXT("%s_Morph_%u"), *SceneInfo.Meshes[MeshIndex].Name, MorphIndex);
+			}
+
+			const int32 AddedIndex = SceneInfo.MorphTargets.Add(MoveTemp(Info));
+			SceneInfo.Meshes[MeshIndex].MorphTargetIndices.Add(AddedIndex);
+		}
+	}
+
+	if (!SceneInfo.MorphTargets.IsEmpty())
+	{
+		UE_LOG(LogAssimp, Verbose, TEXT("Found %d morph target(s) across %d mesh(es)."),
+			SceneInfo.MorphTargets.Num(), SceneInfo.Meshes.Num());
+	}
 }
 
 void FAssimpScene::FImpl::BuildAnimations()
@@ -1142,6 +1405,21 @@ void FAssimpScene::FImpl::BuildSkinnedMeshGroups()
 		Group.RootBoneName = Builder.GetBones()[0].Name;
 		Group.Bones = Builder.GetBones();
 		Group.MeshIndices = MoveTemp(Pair.Value);
+
+		// Resolve each bone onto its entry in the flattened node array by identity.
+		const TArray<const aiNode*>& BoneNodes = Builder.GetBoneNodes();
+		for (int32 BoneIndex = 0; BoneIndex < Group.Bones.Num(); ++BoneIndex)
+		{
+			if (!BoneNodes.IsValidIndex(BoneIndex))
+			{
+				continue;
+			}
+
+			if (const int32* FoundIndex = NodeIndexByPointer.Find(BoneNodes[BoneIndex]))
+			{
+				Group.Bones[BoneIndex].NodeIndex = *FoundIndex;
+			}
+		}
 
 		SceneInfo.SkinnedMeshGroups.Add(MoveTemp(Group));
 	}
@@ -1363,6 +1641,7 @@ int32 FAssimpScene::FImpl::AddNodeRecursive(const aiNode* Node, int32 ParentInde
 	// the flattened array. Consumers rely on that ordering: Interchange, for one, must create a
 	// parent node before it can attach a child to it.
 	const int32 ThisIndex = SceneInfo.Nodes.AddDefaulted();
+	NodeIndexByPointer.Add(Node, ThisIndex);
 
 	{
 		FAssimpNodeInfo& Info = SceneInfo.Nodes[ThisIndex];
@@ -1410,10 +1689,25 @@ void FAssimpScene::FImpl::BuildNodeHierarchy()
 	AddNodeRecursive(Scene->mRootNode, INDEX_NONE, 0);
 }
 
+int32 FAssimpScene::FImpl::FindNodeIndexByName(const FString& NodeName) const
+{
+	if (NodeName.IsEmpty())
+	{
+		return INDEX_NONE;
+	}
+
+	return SceneInfo.Nodes.IndexOfByPredicate(
+		[&NodeName](const FAssimpNodeInfo& Node) { return Node.Name == NodeName; });
+}
+
 void FAssimpScene::FImpl::BuildCamerasAndLights()
 {
 	if (Settings.bImportCameras && Scene->mCameras != nullptr)
 	{
+		// See the field-of-view conversion below for why the format matters here.
+		const FString Extension = FPaths::GetExtension(SceneInfo.SourceFilePath).ToLower();
+		const bool bCameraFovIsHalfAngle = Extension == TEXT("fbx");
+
 		SceneInfo.Cameras.Reserve(static_cast<int32>(Scene->mNumCameras));
 		for (unsigned int Index = 0; Index < Scene->mNumCameras; ++Index)
 		{
@@ -1425,10 +1719,26 @@ void FAssimpScene::FImpl::BuildCamerasAndLights()
 
 			FAssimpCameraInfo Info;
 			Info.Name = FAssimpAxisConverter::ConvertString(Camera->mName);
+			Info.NodeIndex = FindNodeIndexByName(Info.Name);
+			Info.LocalTransform = MakeOrientedTransform(
+				*AxisConverter, Camera->mPosition, Camera->mLookAt, Camera->mUp);
 
-			// Assimp reports the half-angle in radians; Unreal wants the full angle in degrees.
-			Info.HorizontalFieldOfViewDegrees =
-				FMath::RadiansToDegrees(Camera->mHorizontalFOV) * 2.0f;
+			// Unreal wants the full horizontal angle in degrees. What Assimp gives is, awkwardly,
+			// not one consistent thing:
+			//
+			//   camera.h documents mHorizontalFOV as "the angle between the center line of the
+			//   screen and the left or right border" -- a half-angle. FBXConverter honours that
+			//   (`AI_DEG_TO_RAD(fov_deg) * 0.5f`). The Collada loader assigns the file's xfov
+			//   straight through, and glTF2 computes `2 * atan(...)`: both are FULL angles.
+			//
+			// Assuming either one everywhere makes cameras from the other formats exactly twice or
+			// half as wide as they should be, which looks like a plausible shot rather than a bug.
+			// There is no way to tell the two apart from the value -- the plausible ranges overlap --
+			// so the source format decides, which is the only thing that actually determines it.
+			const float FieldOfViewDegrees = FMath::RadiansToDegrees(Camera->mHorizontalFOV);
+			Info.HorizontalFieldOfViewDegrees = bCameraFovIsHalfAngle
+				? FieldOfViewDegrees * 2.0f
+				: FieldOfViewDegrees;
 
 			// Clip planes are distances, so they scale with the scene.
 			const float Scale = AxisConverter->GetAppliedScale();
@@ -1453,7 +1763,17 @@ void FAssimpScene::FImpl::BuildCamerasAndLights()
 
 			FAssimpLightInfo Info;
 			Info.Name = FAssimpAxisConverter::ConvertString(Light->mName);
+			Info.NodeIndex = FindNodeIndexByName(Info.Name);
 			Info.Type = ConvertLightType(Light->mType);
+
+			// A point light has no meaningful direction, and its mDirection is routinely zero. Using
+			// the up axis as the nominal forward keeps the transform well formed without pretending
+			// the file said anything about which way it faces.
+			Info.LocalTransform = MakeOrientedTransform(
+				*AxisConverter,
+				Light->mPosition,
+				Light->mType == aiLightSource_POINT ? aiVector3D(0.0f, 1.0f, 0.0f) : Light->mDirection,
+				Light->mUp);
 			Info.DiffuseColor = FAssimpAxisConverter::ConvertColor(Light->mColorDiffuse);
 			Info.InnerConeAngleDegrees = FMath::RadiansToDegrees(Light->mAngleInnerCone);
 			Info.OuterConeAngleDegrees = FMath::RadiansToDegrees(Light->mAngleOuterCone);

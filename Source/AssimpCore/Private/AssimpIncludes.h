@@ -42,6 +42,7 @@
 
 THIRD_PARTY_INCLUDES_START
 
+#include "assimp/Exporter.hpp"
 #include "assimp/Importer.hpp"
 #include "assimp/IOStream.hpp"
 #include "assimp/IOSystem.hpp"

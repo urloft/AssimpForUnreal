@@ -60,6 +60,15 @@ public:
 	/** Bone names in index order, which is the form Interchange's mesh payload expects. */
 	TArray<FString> GetBoneNames() const;
 
+	/**
+	 * The source node each bone came from, parallel to GetBones().
+	 *
+	 * Identity rather than name, so a caller can map a bone onto its entry in the flattened node
+	 * array without a name lookup -- which would be both ambiguous between duplicate names and,
+	 * because FString compares case-insensitively, wrong for names that differ only in case.
+	 */
+	const TArray<const aiNode*>& GetBoneNodes() const { return BoneNodes; }
+
 private:
 	/** Locates the aiNode for each named bone. Returns false when none are found. */
 	bool CollectBoneNodes(
@@ -95,6 +104,9 @@ private:
 		TSet<const aiNode*>& InOutRelevantNodes);
 
 	TArray<FBone> Bones;
+
+	/** Source node per entry of Bones, in the same order. */
+	TArray<const aiNode*> BoneNodes;
 
 	/** Name-to-index lookup, so skin weights can resolve a bone name in constant time. */
 	TMap<FString, int32> BoneNameToIndex;

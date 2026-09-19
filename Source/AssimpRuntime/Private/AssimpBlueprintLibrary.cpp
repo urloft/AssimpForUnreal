@@ -3,12 +3,18 @@
 #include "AssimpBlueprintLibrary.h"
 
 #include "AssimpCore.h"
+#include "AssimpExporter.h"
 #include "AssimpRuntime.h"
 #include "AssimpScene.h"
 #include "AssimpSceneObject.h"
 
 #include "AssimpSceneTypes.h"
+#include "MeshDescription.h"
+#include "Camera/CameraComponent.h"
+#include "Components/DirectionalLightComponent.h"
 #include "Components/DynamicMeshComponent.h"
+#include "Components/PointLightComponent.h"
+#include "Components/SpotLightComponent.h"
 #include "GameFramework/Actor.h"
 #include "Engine/Texture2D.h"
 #include "Materials/Material.h"
@@ -212,6 +218,59 @@ namespace AssimpRuntimePrivate
 		}
 	}
 
+	/**
+	 * Turns a light's physical falloff into the cutoff radius Unreal actually uses.
+	 *
+	 * The two models do not correspond. Assimp reports the classic constant/linear/quadratic triple,
+	 * which describes how brightness decays and never quite reaches zero; Unreal takes a radius at
+	 * which the light simply stops being evaluated. Converting means choosing where "dark enough"
+	 * is, so this solves for the distance at which the falloff divisor reaches 256 -- the point at
+	 * which an 8-bit channel has nothing left to show.
+	 *
+	 * @param Light         Light to convert.
+	 * @param AppliedScale  Scene scale, because the coefficients are in source units and the radius
+	 *                      must come out in Unreal ones.
+	 * @return              A radius in Unreal units, or 0 when the file gave nothing to work with
+	 *                      and the component's own default should stand.
+	 */
+	float ComputeAttenuationRadius(const FAssimpLightInfo& Light, float AppliedScale)
+	{
+		const float Constant = FMath::Max(Light.AttenuationConstant, 0.0f);
+		const float Linear = FMath::Max(Light.AttenuationLinear, 0.0f);
+		const float Quadratic = FMath::Max(Light.AttenuationQuadratic, 0.0f);
+
+		// Constant-only attenuation never decays with distance, so there is no radius to derive.
+		if (Linear <= UE_SMALL_NUMBER && Quadratic <= UE_SMALL_NUMBER)
+		{
+			return 0.0f;
+		}
+
+		constexpr float CutoffDivisor = 256.0f;
+		const float Target = CutoffDivisor - Constant;
+		if (Target <= 0.0f)
+		{
+			// Already below the threshold at zero distance: a degenerate light, not a tiny one.
+			return 0.0f;
+		}
+
+		float DistanceInSourceUnits = 0.0f;
+
+		if (Quadratic > UE_SMALL_NUMBER)
+		{
+			// Quadratic * d^2 + Linear * d - Target = 0, positive root.
+			const float Discriminant = Linear * Linear + 4.0f * Quadratic * Target;
+			DistanceInSourceUnits = (-Linear + FMath::Sqrt(Discriminant)) / (2.0f * Quadratic);
+		}
+		else
+		{
+			DistanceInSourceUnits = Target / Linear;
+		}
+
+		const float Radius = DistanceInSourceUnits * FMath::Max(AppliedScale, UE_SMALL_NUMBER);
+
+		return FMath::IsFinite(Radius) ? FMath::Max(Radius, 0.0f) : 0.0f;
+	}
+
 	/** Copies the parts of an FAssimpLoadResult that Blueprint should see. */
 	FAssimpRuntimeImportResult ConvertResult(const FAssimpLoadResult& LoadResult)
 	{
@@ -390,6 +449,235 @@ TArray<UDynamicMeshComponent*> UAssimpBlueprintLibrary::SpawnSceneAsDynamicMeshC
 		Created.Num(), *Info.SourceFilePath);
 
 	return Created;
+}
+
+TArray<USceneComponent*> UAssimpBlueprintLibrary::SpawnSceneCamerasAndLights(
+	AActor* Actor,
+	UAssimpSceneObject* SceneObject)
+{
+	TArray<USceneComponent*> Created;
+
+	if (Actor == nullptr || SceneObject == nullptr || !SceneObject->IsValidScene())
+	{
+		UE_LOG(LogAssimpRuntime, Warning,
+			TEXT("SpawnSceneCamerasAndLights called with an invalid actor or scene."));
+		return Created;
+	}
+
+	const FAssimpSceneInfo& Info = SceneObject->GetSceneInfo();
+
+	if (Info.Cameras.IsEmpty() && Info.Lights.IsEmpty())
+	{
+		return Created;
+	}
+
+	USceneComponent* RootComponent = Actor->GetRootComponent();
+
+	// Same forward pass as the mesh spawner: a parent always precedes its children, so each node's
+	// world transform is known by the time it is needed.
+	TArray<FTransform> WorldTransforms;
+	WorldTransforms.SetNum(Info.Nodes.Num());
+	for (int32 NodeIndex = 0; NodeIndex < Info.Nodes.Num(); ++NodeIndex)
+	{
+		const FAssimpNodeInfo& Node = Info.Nodes[NodeIndex];
+		WorldTransforms[NodeIndex] = Info.Nodes.IsValidIndex(Node.ParentIndex)
+			? Node.LocalTransform * WorldTransforms[Node.ParentIndex]
+			: Node.LocalTransform;
+	}
+
+	/** Composes a camera or light's own placement with the transform of the node carrying it. */
+	auto ResolveTransform = [&Info, &WorldTransforms](int32 NodeIndex, const FTransform& LocalTransform)
+	{
+		return Info.Nodes.IsValidIndex(NodeIndex)
+			? LocalTransform * WorldTransforms[NodeIndex]
+			: LocalTransform;
+	};
+
+	/** Attaches, registers and places a freshly created component. */
+	auto Attach = [RootComponent, &Created](USceneComponent* Component, const FTransform& Transform)
+	{
+		Component->SetupAttachment(RootComponent);
+		Component->RegisterComponent();
+		Component->SetRelativeTransform(Transform);
+		Created.Add(Component);
+	};
+
+	// --- Cameras ---------------------------------------------------------------------------------
+	for (int32 CameraIndex = 0; CameraIndex < Info.Cameras.Num(); ++CameraIndex)
+	{
+		const FAssimpCameraInfo& Camera = Info.Cameras[CameraIndex];
+
+		UCameraComponent* Component = NewObject<UCameraComponent>(
+			Actor,
+			MakeUniqueObjectName(Actor, UCameraComponent::StaticClass(),
+				*FString::Printf(TEXT("AssimpCamera_%d"), CameraIndex)));
+
+		if (Component == nullptr)
+		{
+			continue;
+		}
+
+		// Unreal's FieldOfView is the horizontal angle in degrees, which is what the scene
+		// description already carries.
+		if (Camera.HorizontalFieldOfViewDegrees > 0.0f)
+		{
+			Component->SetFieldOfView(FMath::Clamp(Camera.HorizontalFieldOfViewDegrees, 1.0f, 170.0f));
+		}
+
+		// An aspect ratio of 0 means the file did not state one, in which case the component should
+		// keep following the viewport rather than be locked to a fabricated value.
+		if (Camera.AspectRatio > 0.0f)
+		{
+			Component->SetAspectRatio(Camera.AspectRatio);
+			Component->SetConstraintAspectRatio(true);
+		}
+
+		Attach(Component, ResolveTransform(Camera.NodeIndex, Camera.LocalTransform));
+	}
+
+	// --- Lights ----------------------------------------------------------------------------------
+	int32 SkippedLights = 0;
+
+	for (int32 LightIndex = 0; LightIndex < Info.Lights.Num(); ++LightIndex)
+	{
+		const FAssimpLightInfo& Light = Info.Lights[LightIndex];
+
+		const FName ComponentName(*FString::Printf(TEXT("AssimpLight_%d"), LightIndex));
+
+		ULightComponent* Component = nullptr;
+
+		switch (Light.Type)
+		{
+		case EAssimpLightType::Directional:
+			Component = NewObject<UDirectionalLightComponent>(
+				Actor, MakeUniqueObjectName(Actor, UDirectionalLightComponent::StaticClass(), ComponentName));
+			break;
+
+		case EAssimpLightType::Point:
+			Component = NewObject<UPointLightComponent>(
+				Actor, MakeUniqueObjectName(Actor, UPointLightComponent::StaticClass(), ComponentName));
+			break;
+
+		case EAssimpLightType::Spot:
+			Component = NewObject<USpotLightComponent>(
+				Actor, MakeUniqueObjectName(Actor, USpotLightComponent::StaticClass(), ComponentName));
+			break;
+
+		default:
+			// Ambient and area lights have no component that means the same thing in Unreal. An
+			// ambient term is not a light at all, and an area light's shape is the half of it that
+			// matters, which the scene description does not carry. Substituting a point light for
+			// either would silently change how the scene reads, so they are reported instead.
+			++SkippedLights;
+			continue;
+		}
+
+		if (Component == nullptr)
+		{
+			continue;
+		}
+
+		// Colour transfers; intensity does not. See the header for why.
+		Component->SetLightColor(Light.DiffuseColor);
+
+		if (USpotLightComponent* Spot = Cast<USpotLightComponent>(Component))
+		{
+			// Assimp states the FULL cone angle -- its own header notes the inner angle is 2*PI for
+			// a point light -- while Unreal takes half-angles measured from the light's axis.
+			Spot->SetInnerConeAngle(FMath::Clamp(Light.InnerConeAngleDegrees * 0.5f, 0.0f, 89.0f));
+			Spot->SetOuterConeAngle(FMath::Clamp(Light.OuterConeAngleDegrees * 0.5f, 0.0f, 89.0f));
+		}
+
+		if (UPointLightComponent* Point = Cast<UPointLightComponent>(Component))
+		{
+			const float Radius = AssimpRuntimePrivate::ComputeAttenuationRadius(Light, Info.AppliedScale);
+			if (Radius > 0.0f)
+			{
+				Point->SetAttenuationRadius(Radius);
+			}
+		}
+
+		Attach(Component, ResolveTransform(Light.NodeIndex, Light.LocalTransform));
+	}
+
+	if (SkippedLights > 0)
+	{
+		UE_LOG(LogAssimpRuntime, Warning,
+			TEXT("%d light(s) in '%s' are ambient or area lights and were not spawned: neither has an ")
+			TEXT("Unreal component that means the same thing."),
+			SkippedLights, *Info.SourceFilePath);
+	}
+
+	UE_LOG(LogAssimpRuntime, Log,
+		TEXT("Spawned %d camera/light component(s) from '%s'."),
+		Created.Num(), *Info.SourceFilePath);
+
+	return Created;
+}
+
+bool UAssimpBlueprintLibrary::ExportSceneToFile(
+	UAssimpSceneObject* SceneObject,
+	const FString& FilePath,
+	const FString& FormatId,
+	FAssimpExportResult& OutResult)
+{
+	OutResult = FAssimpExportResult();
+
+	if (SceneObject == nullptr || !SceneObject->IsValidScene())
+	{
+		OutResult.ErrorMessage = TEXT("No valid scene to export.");
+		UE_LOG(LogAssimpRuntime, Warning, TEXT("%s"), *OutResult.ErrorMessage);
+		return false;
+	}
+
+	const TSharedPtr<FAssimpScene> Scene = SceneObject->GetScene();
+	if (!Scene.IsValid())
+	{
+		OutResult.ErrorMessage = TEXT("The scene object holds no parsed scene.");
+		return false;
+	}
+
+	const FAssimpSceneInfo& Info = SceneObject->GetSceneInfo();
+
+	// Converted up front and held for the duration: FAssimpExporter::FExportMesh borrows its mesh
+	// description rather than copying, so every one of them has to outlive the export call.
+	TArray<FMeshDescription> MeshDescriptions;
+	MeshDescriptions.SetNum(Info.Meshes.Num());
+
+	TArray<FAssimpExporter::FExportMesh> ExportMeshes;
+	ExportMeshes.Reserve(Info.Meshes.Num());
+
+	for (int32 MeshIndex = 0; MeshIndex < Info.Meshes.Num(); ++MeshIndex)
+	{
+		if (!Scene->GetMeshDescription(MeshIndex, MeshDescriptions[MeshIndex]))
+		{
+			// One unconvertible mesh should not lose the rest of the model.
+			UE_LOG(LogAssimpRuntime, Warning,
+				TEXT("Mesh %d ('%s') could not be converted and was left out of the export."),
+				MeshIndex, *Info.Meshes[MeshIndex].Name);
+			continue;
+		}
+
+		FAssimpExporter::FExportMesh ExportMesh;
+		ExportMesh.Name = Info.Meshes[MeshIndex].Name;
+		ExportMesh.MeshDescription = &MeshDescriptions[MeshIndex];
+
+		ExportMeshes.Add(MoveTemp(ExportMesh));
+	}
+
+	if (ExportMeshes.IsEmpty())
+	{
+		OutResult.ErrorMessage = TEXT("The scene holds no mesh that could be converted for export.");
+		UE_LOG(LogAssimpRuntime, Warning, TEXT("%s"), *OutResult.ErrorMessage);
+		return false;
+	}
+
+	return FAssimpExporter::ExportMeshes(ExportMeshes, FilePath, FormatId, OutResult);
+}
+
+TArray<FAssimpExportFormat> UAssimpBlueprintLibrary::GetSupportedExportFormats()
+{
+	return FAssimpExporter::GetSupportedFormats();
 }
 
 TArray<FString> UAssimpBlueprintLibrary::GetSupportedImportExtensions()

@@ -129,7 +129,10 @@ Write-Note "commit : $AssimpCommit"
 #                                linking that statically into Unreal collides with the engine's
 #                                zlib symbols. A DLL keeps Assimp's zlib private to the DLL.
 #   USE_STATIC_CRT=OFF           Unreal compiles against the dynamic CRT (/MD). These must match.
-#   ASSIMP_NO_EXPORT=ON          We only import; drops every exporter, roughly halving the DLL.
+#   ASSIMP_NO_EXPORT=OFF         Build the exporters in. They add roughly 20% to the DLL, which is the
+#                                price of the export API; without them Assimp::Exporter reports zero
+#                                formats and every export call fails at runtime rather than at build
+#                                time, which is a much worse way to find out.
 #   ASSIMP_BUILD_ZLIB=ON         Use Assimp's vendored zlib so the DLL is self-contained.
 #   ASSIMP_IGNORE_GIT_HASH=ON    Keeps the build reproducible.
 #   ASSIMP_INJECT_DEBUG_POSTFIX=OFF  One output filename across configurations.
@@ -142,7 +145,7 @@ $CMakeArgs = @(
     '-DCMAKE_BUILD_TYPE=Release'
     '-DBUILD_SHARED_LIBS=ON'
     '-DUSE_STATIC_CRT=OFF'
-    '-DASSIMP_NO_EXPORT=ON'
+    '-DASSIMP_NO_EXPORT=OFF'
     '-DASSIMP_BUILD_ZLIB=ON'
     # Draco-compressed glTF is common in the wild (Sketchfab and friends export it by default) and
     # Assimp refuses those files outright without it. The source is bundled in contrib/draco, so

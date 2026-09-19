@@ -20,7 +20,7 @@ editor behaves identically at runtime.
 
 ## Status
 
-Assimp **6.0.5** · Unreal Engine **5.8** · **Win64** · 18 automation tests plus a ~400-file corpus sweep, all passing.
+Assimp **6.0.5** · Unreal Engine **5.8** · **Win64** · 22 automation tests plus a ~400-file corpus sweep, all passing.
 
 This is a **beta**. What works and what does not:
 
@@ -36,10 +36,10 @@ This is a **beta**. What works and what does not:
 | Skeletons → `USkeleton` + `USkeletalMesh` — hierarchy, reference pose, skin weights | **Working** |
 | **Animation → `UAnimSequence`** — baked bone tracks | **Working** |
 | Cameras and lights — described in the scene data | **Working** |
-| **Morph targets** | **Not implemented** |
-| Cameras/lights spawned as components by the runtime API | **Not implemented** (data is exposed; spawning is not) |
+| **Morph targets** → `UMorphTarget`, with animated weights | **Working** |
+| Cameras and lights spawned as components by the runtime API | **Working** |
+| **Export** — geometry, through any format Assimp can write | **Working** (see below) |
 | Linux, macOS, Android, iOS | **Not supported** — layout is per-platform, but only Win64 binaries are built |
-| Export | **Not supported** by design (Assimp is built with `ASSIMP_NO_EXPORT`) |
 
 ### On animation
 
@@ -59,8 +59,56 @@ Two details are worth knowing because they are where this usually goes wrong:
   scale separately gives a different rotation axis and a character whose limbs bend the wrong way.
   Each key is recomposed into a matrix and put through the same conversion the reference pose used.
 
-Still missing: **morph targets**. A clip that also animates morph or mesh channels imports its bone
-tracks and says so in the import report rather than dropping them silently.
+### On morph targets
+
+Morph targets import as `UMorphTarget`s on the skeletal mesh, and a clip that animates their weights
+brings those curves along with its bone tracks.
+
+Assimp stores a morph target as a whole replacement vertex array rather than as deltas, and Unreal
+works out the deltas by comparing it against the base mesh *per vertex index*. So the two conversions
+have to agree on vertex order exactly -- which is why a morph target goes through the same conversion
+as the mesh it deforms, with only positions and normals substituted, rather than through a second
+code path. A morph target built by separate code is the kind that tears a mesh apart instead of
+deforming it.
+
+### On cameras and lights
+
+`SpawnSceneCamerasAndLights` creates a `UCameraComponent` or the matching light component per camera
+and light the file defines, placed by the node it hangs off. Two conversions are worth knowing about:
+
+- **Cone angles are full angles in the file and half-angles in Unreal.** Assimp's own header settles
+  it -- the inner angle is documented as 2*PI for a point light, which only makes sense as a full
+  angle. Passing it through unhalved makes every spot light twice as wide as its author drew it.
+- **Field of view is normalised per format**, because Assimp is not consistent: its header documents
+  a half-angle and FBX stores one, while Collada and glTF store the full angle. Reading either one
+  everywhere makes cameras from the other formats exactly twice or half as wide.
+
+Intensity is deliberately *not* taken from the file. Assimp reports a colour whose magnitude carries
+the intensity in whatever units the exporter used, and there is no unit to convert from; the colour
+is applied and the intensity left at Unreal's default, which is a visible light that can be tuned
+rather than one that is invisible or blinding depending on which tool wrote the file. Ambient and
+area lights are reported rather than substituted, having no Unreal component that means the same.
+
+Note that `bImportCameras` and `bImportLights` both default to **false**.
+
+### On export
+
+`ExportSceneToFile` writes geometry through any format the vendored Assimp can write (22 of them, as
+built). The export is the import run backwards: the coordinate change of basis, the winding reversal
+and the V flip are each inverted by the function beside the one that applied them, not reimplemented,
+because a separately written exporter is how one ends up disagreeing with its importer -- which shows
+up as a model that survives one round trip looking mirrored and two round trips looking correct.
+
+This is **geometry only**, in a single flat node: material names, skinning and animation are not
+written. That is a floor rather than an oversight, and the round-trip test is why it is drawn there
+-- exporting the rest is a much larger piece of work than verifying this much.
+
+One trap worth recording, because it cost an afternoon: `aiScene`, `aiNode` and `aiMaterial` are
+declared `ASSIMP_API`, so their destructors are compiled into `assimp.dll` and run *there*. Unreal
+overrides global `operator new`, so anything the plugin allocates lives on Unreal's heap, and letting
+`~aiScene()` free it is `assimp.dll`'s CRT releasing a pointer it never allocated. That raises no
+error: the process simply dies, with no crash log, some time after the export has already reported
+success.
 
 ---
 
@@ -295,7 +343,7 @@ fixtures, formats requiring absent external files, and encodings Assimp cannot r
 "C:/Program Files/Epic Games/UE_5.8/Engine/Binaries/Win64/UnrealEditor-Cmd.exe" YourProject.uproject -ExecCmds="Automation RunTests AssimpForUnreal" -TestExit="Automation Test Queue Empty" -unattended -nullrhi -nosplash -NoSound
 ```
 
-18 tests across four groups. The fixtures in `Tests/Data` are hand-authored ASCII (or generated by a
+22 tests across four groups. The fixtures in `Tests/Data` are hand-authored ASCII (or generated by a
 committed script) so their expected values can be derived by reading them.
 
 The tests deliberately assert geometry, not just success. A handedness or winding mistake still
@@ -316,6 +364,11 @@ produces a mesh with the right triangle count, so counting triangles proves noth
   anything, must land on Unreal's neutral `Specular` of 0.5 and leave the model looking untouched;
   the specular exponent must order two materials the way the file does.
 - `Interchange.ImportStaticMesh` — a `.ply` becomes a real `UStaticMesh` with its topology intact.
+- `Core.ExportRoundTrip` — a mesh exported and reimported must come back with the same bounds and
+  no face inside out. Run on an asymmetric shape as well as a cube, because applying the basis change
+  again instead of inverting it leaves a symmetric cube's bounds exactly where they were.
+- `Runtime.SpawnCamerasAndLights` — a camera must end up where the file put it, looking along
+  Unreal's +X, and a 30-degree cone must arrive as a 15-degree half-angle.
 - `Interchange.ImportSkeletalAnimation` — a `.dae` becomes a `USkeleton`, a `USkeletalMesh` and a
   `UAnimSequence` whose bone track moves the right way. Collada rather than glTF on purpose:
   Interchange picks a translator by iterating a set, so where the engine claims the same extension
@@ -361,6 +414,8 @@ grep -r '#include "assimp/' Source --include=*.h    # must match only AssimpIncl
 | Automated tests | No | 18 |
 | Runtime Blueprint import | Yes | Yes |
 | Animation import | Partial | Yes — baked bone tracks to `UAnimSequence` |
+| Morph targets | No | Yes — with animated weights |
+| Export | No | Yes — geometry, any format Assimp writes |
 | Platforms | Win64, Mac, Linux, Android | Win64 only |
 
 Two concrete defects in that plugin this one avoids by construction:

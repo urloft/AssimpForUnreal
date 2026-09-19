@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  AssimpForUnreal test fixture: one camera and two lights, with a triangle so the scene is not empty.
+
+  Collada rather than glTF because glTF has no lights without an extension, and because the runtime
+  spawner is what this exercises -- a format Assimp reads and the engine does not keeps the test
+  honest about which translator produced the data.
+
+  The placements are chosen so a conversion error is visible rather than plausible:
+
+    Camera    at (2, 0, 0) looking down -Z, Collada's convention. Under the plugin's basis change
+              (Unreal.X = -Source.Z, Unreal.Y = Source.X, Unreal.Z = Source.Y) the position becomes
+              (0, 2, 0) and the view direction becomes Unreal's +X, which is where an Unreal camera
+              looks.
+    Spot      hangs off a node translated (0, 3, 0), which is (0, 0, 3) in Unreal -- straight up.
+              Its 30/45 degree cone is stated as a FULL angle by Collada and Assimp, so Unreal's
+              half-angles must come out as 15 and 22.5.
+    Point     at the origin, with a quadratic falloff the attenuation conversion turns into a radius.
+
+  Collada is right-handed Y-up. Matrices are listed row by row and act on column vectors.
+-->
+<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">
+  <asset>
+    <contributor>
+      <authoring_tool>AssimpForUnreal test fixture</authoring_tool>
+    </contributor>
+    <unit meter="1" name="meter"/>
+    <up_axis>Y_UP</up_axis>
+  </asset>
+
+  <library_cameras>
+    <camera id="TestCamera" name="TestCamera">
+      <optics>
+        <technique_common>
+          <perspective>
+            <xfov>60</xfov>
+            <aspect_ratio>1.5</aspect_ratio>
+            <znear>0.1</znear>
+            <zfar>1000</zfar>
+          </perspective>
+        </technique_common>
+      </optics>
+    </camera>
+  </library_cameras>
+
+  <library_lights>
+    <light id="TestSpot" name="TestSpot">
+      <technique_common>
+        <spot>
+          <color>1 0.5 0.25</color>
+          <constant_attenuation>1</constant_attenuation>
+          <linear_attenuation>0</linear_attenuation>
+          <quadratic_attenuation>0.25</quadratic_attenuation>
+          <falloff_angle>30</falloff_angle>
+        </spot>
+      </technique_common>
+    </light>
+
+    <light id="TestPoint" name="TestPoint">
+      <technique_common>
+        <point>
+          <color>0.25 0.5 1</color>
+          <constant_attenuation>1</constant_attenuation>
+          <linear_attenuation>0</linear_attenuation>
+          <quadratic_attenuation>0.0625</quadratic_attenuation>
+        </point>
+      </technique_common>
+    </light>
+  </library_lights>
+
+  <library_geometries>
+    <geometry id="Triangle-mesh" name="Triangle">
+      <mesh>
+        <source id="Triangle-positions">
+          <float_array id="Triangle-positions-array" count="9">
+            0 0 0  1 0 0  0 1 0
+          </float_array>
+          <technique_common>
+            <accessor source="#Triangle-positions-array" count="3" stride="3">
+              <param name="X" type="float"/>
+              <param name="Y" type="float"/>
+              <param name="Z" type="float"/>
+            </accessor>
+          </technique_common>
+        </source>
+        <vertices id="Triangle-vertices">
+          <input semantic="POSITION" source="#Triangle-positions"/>
+        </vertices>
+        <triangles count="1">
+          <input semantic="VERTEX" source="#Triangle-vertices" offset="0"/>
+          <p>0 1 2</p>
+        </triangles>
+      </mesh>
+    </geometry>
+  </library_geometries>
+
+  <library_visual_scenes>
+    <visual_scene id="Scene" name="Scene">
+      <node id="Geometry" name="Geometry" type="NODE">
+        <matrix sid="transform">1 0 0 0  0 1 0 0  0 0 1 0  0 0 0 1</matrix>
+        <instance_geometry url="#Triangle-mesh"/>
+      </node>
+
+      <!-- Two units along source X, which is Unreal's +Y. -->
+      <node id="CameraNode" name="CameraNode" type="NODE">
+        <matrix sid="transform">1 0 0 2  0 1 0 0  0 0 1 0  0 0 0 1</matrix>
+        <instance_camera url="#TestCamera"/>
+      </node>
+
+      <!-- Three units up on source Y, which is Unreal's +Z. -->
+      <node id="SpotNode" name="SpotNode" type="NODE">
+        <matrix sid="transform">1 0 0 0  0 1 0 3  0 0 1 0  0 0 0 1</matrix>
+        <instance_light url="#TestSpot"/>
+      </node>
+
+      <node id="PointNode" name="PointNode" type="NODE">
+        <matrix sid="transform">1 0 0 0  0 1 0 0  0 0 1 0  0 0 0 1</matrix>
+        <instance_light url="#TestPoint"/>
+      </node>
+    </visual_scene>
+  </library_visual_scenes>
+
+  <scene>
+    <instance_visual_scene url="#Scene"/>
+  </scene>
+</COLLADA>

@@ -72,7 +72,8 @@ bool FAssimpMeshConverter::Convert(
 	const FAssimpImportSettings& Settings,
 	FMeshDescription& OutMeshDescription,
 	TArray<FString>& OutJointNames,
-	FString& OutError)
+	FString& OutError,
+	int32 MorphTargetIndex)
 {
 	OutJointNames.Reset();
 
@@ -228,6 +229,39 @@ bool FAssimpMeshConverter::Convert(
 		}
 		MaterialSlots[PolygonGroupID] = FName(*SlotName);
 
+		// A morph target replaces the mesh's positions, and usually its normals, leaving everything
+		// else to come from the base mesh. Assimp promises the replacement arrays have the same
+		// vertex count; files do not always keep that promise, so it is checked rather than trusted.
+		const aiVector3D* PositionSource = Mesh.mVertices;
+		const aiVector3D* NormalSource = Mesh.mNormals;
+
+		if (MorphTargetIndex != INDEX_NONE)
+		{
+			const aiAnimMesh* MorphTarget =
+				(Mesh.mAnimMeshes != nullptr
+					&& MorphTargetIndex >= 0
+					&& static_cast<unsigned int>(MorphTargetIndex) < Mesh.mNumAnimMeshes)
+				? Mesh.mAnimMeshes[MorphTargetIndex]
+				: nullptr;
+
+			if (MorphTarget == nullptr || MorphTarget->mNumVertices != Mesh.mNumVertices)
+			{
+				OutError = FString::Printf(
+					TEXT("Morph target %d of mesh '%s' is missing or does not match the mesh's %u vertices."),
+					MorphTargetIndex, *FAssimpAxisConverter::ConvertString(Mesh.mName), Mesh.mNumVertices);
+				return false;
+			}
+
+			if (MorphTarget->mVertices != nullptr)
+			{
+				PositionSource = MorphTarget->mVertices;
+			}
+			if (MorphTarget->mNormals != nullptr)
+			{
+				NormalSource = MorphTarget->mNormals;
+			}
+		}
+
 		// Invert Assimp's skinning layout before creating vertices.
 		//
 		// Assimp stores skinning bone-major: each aiBone lists the vertices it influences. Unreal
@@ -296,7 +330,7 @@ bool FAssimpMeshConverter::Convert(
 		for (unsigned int Index = 0; Index < Mesh.mNumVertices; ++Index)
 		{
 			const FVertexID VertexID = OutMeshDescription.CreateVertex();
-			VertexPositions[VertexID] = AxisConverter.ConvertPosition(Mesh.mVertices[Index]);
+			VertexPositions[VertexID] = AxisConverter.ConvertPosition(PositionSource[Index]);
 			VertexIDs.Add(VertexID);
 
 			if (bSkinned)
@@ -319,7 +353,7 @@ bool FAssimpMeshConverter::Convert(
 			}
 		}
 
-		const bool bMeshHasNormals    = Mesh.HasNormals();
+		const bool bMeshHasNormals    = NormalSource != nullptr;
 		const bool bMeshHasTangents   = Mesh.HasTangentsAndBitangents();
 		const bool bMeshHasColors     = Mesh.HasVertexColors(VertexColorSetIndex);
 		const int32 MeshUVChannels    = GetUsedUVChannelCount(Mesh);
@@ -370,7 +404,7 @@ bool FAssimpMeshConverter::Convert(
 
 				if (bMeshHasNormals)
 				{
-					const FVector3f Normal = AxisConverter.ConvertDirection(Mesh.mNormals[SourceIndex]).GetSafeNormal();
+					const FVector3f Normal = AxisConverter.ConvertDirection(NormalSource[SourceIndex]).GetSafeNormal();
 					Normals[InstanceID] = Normal;
 
 					if (bMeshHasTangents)
